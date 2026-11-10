@@ -1,0 +1,38 @@
+# --- game-derived files: never commit ---
+*.iso
+*.xbe
+*.xiso
+game/
+xboxrecomp/game_files/
+xboxrecomp/tools/*/output/
+conker/src/recomp/gen/*
+!conker/src/recomp/gen/.gitkeep
+conker/translation/out/
+conker/translation/ru/
+conker/translation/strings_*
+conker/translation/menus_*
+conker-android/app/src/main/assets/spv.pack
+conker-android/app/src/main/assets/pipekeys.bin
+conker-android/app/src/main/assets/lang_ru*
+*.apk
+
+# --- fetched third-party sources ---
+SDL2/
+nv2a-port/third_party/glslang/
+conker/third_party/ffmpeg/ffmpeg-7.1*
+conker/third_party/ffmpeg/lib/
+conker/third_party/ffmpeg/include/
+conker/third_party/ffmpeg/build/
+
+# --- build output ---
+build/
+build-*/
+conker-android/app/build/
+conker-android/app/.cxx/
+conker-android/.gradle/
+conker-android/app/src/main/jniLibs/
+conker-android/local.properties
+__pycache__/
+*.pyc
+.DS_Store
+*.pre_*
