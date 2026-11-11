@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <limits.h>
+#include "bionic_compat.h"
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>

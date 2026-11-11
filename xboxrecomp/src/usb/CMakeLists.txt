@@ -2,6 +2,7 @@
 
 add_library(xbox_usb STATIC
     ohci.c
+    nvnet.c
     usb_gamepad.c
 )
 

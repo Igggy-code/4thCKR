@@ -35,6 +35,14 @@ set(KERNEL_SOURCES
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
+# xemu's NV2A as the GPU (nv2a-port). The consuming project defines the
+# nv2a_xemu target before adding the toolkit.
+if(TARGET nv2a_xemu AND NOT WIN32)
+    target_sources(xbox_kernel PRIVATE nv2a_xemu_glue.c)
+    target_compile_definitions(xbox_kernel PUBLIC XBOXRECOMP_NV2A_XEMU=1)
+    target_link_libraries(xbox_kernel PUBLIC nv2a_xemu)
+endif()
+
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
@@ -50,8 +58,13 @@ if(WIN32)
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    # kernel_crypto.c is self-contained (software SHA-1/RC4/HMAC); OpenSSL is
+    # only linked when present. Android has none.
+    find_package(OpenSSL QUIET)
+    target_link_libraries(xbox_kernel PUBLIC platform)
+    if(OpenSSL_FOUND)
+        target_link_libraries(xbox_kernel PUBLIC OpenSSL::Crypto)
+    endif()
 endif()
 
 if(MSVC)

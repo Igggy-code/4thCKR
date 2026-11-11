@@ -908,6 +908,7 @@ enum {
     XBOX_IRQ_VBLANK,
     XBOX_IRQ_APU,
     XBOX_IRQ_OHCI,
+    XBOX_IRQ_NIC,
     XBOX_IRQ_LINES
 };
 /* What xbox_IrqPost tells the device model to do. */
