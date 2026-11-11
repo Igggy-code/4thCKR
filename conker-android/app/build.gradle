@@ -1,0 +1,46 @@
+apply plugin: 'com.android.application'
+
+// Native code: by default the APK packages the prebuilt libraries in
+// src/main/jniLibs/arm64-v8a (libmain.so + libSDL2.so, built by build_native.sh).
+// Pass -PnativeFromCMake to let Gradle run CMake itself (Android Studio).
+def nativeFromCMake = project.hasProperty('nativeFromCMake')
+
+android {
+    namespace "org.recomp.conker"
+    compileSdk 35
+    ndkVersion "28.0.13004108"
+    defaultConfig {
+        applicationId "org.recomp.conker"
+        minSdkVersion 29
+        targetSdkVersion 35
+        versionCode 1
+        versionName "0.22.156"
+        ndk { abiFilters 'arm64-v8a' }
+        if (nativeFromCMake) {
+            externalNativeBuild {
+                cmake {
+                    arguments "-DANDROID_STL=c++_static", "-DANDROID_PLATFORM=android-29",
+                              "-DXBOXRECOMP_BUILD_D3D8=OFF", "-DCMAKE_BUILD_TYPE=Release"
+                    abiFilters 'arm64-v8a'
+                }
+            }
+        }
+    }
+    buildTypes {
+        debug { jniDebuggable false }
+        release {
+            debuggable true          // diagnostic build: debuggerd -b for thread stacks
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+    if (nativeFromCMake) {
+        externalNativeBuild {
+            cmake { path 'jni/CMakeLists.txt'; version "3.31.6" }
+        }
+    }
+    packagingOptions {
+        jniLibs { useLegacyPackaging true; keepDebugSymbols += ['**/*.so'] }
+    }
+    lint { abortOnError false }
+}
