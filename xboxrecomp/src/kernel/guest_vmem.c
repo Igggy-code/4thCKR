@@ -362,3 +362,29 @@ int guest_vmem_query(uint32_t address, uint32_t info[7])
     info[6] = first.state ? MEM_PRIVATE_TYPE : 0;           /* Type */
     return 1;
 }
+
+/* A reservation (optionally committed) anywhere in the tracked range: the
+ * first free 64 KiB-aligned run that fits. The guest heap below RAM's top is
+ * one contiguous 48 MB pool that fragments over a long session; when it can
+ * no longer back a request, this space above the mirrors (host memory,
+ * committed on demand) can. Returns 1 and sets *base on success. */
+int guest_vmem_allocate_any(uint32_t size, uint32_t alloc_type, uint32_t protect, uint32_t *base)
+{
+    int ok = 0;
+    if (!s_pages || !size)
+        return 0;
+    if (!(alloc_type & (MEM_RESERVE_FLAG | MEM_COMMIT_FLAG)))
+        return 0;
+    alloc_type |= MEM_RESERVE_FLAG;
+    size = (size + VMEM_PAGE - 1) & ~(VMEM_PAGE - 1);
+    AcquireSRWLockExclusive(&s_lock);
+    for (uint32_t a = (s_lo + 0xFFFFu) & ~0xFFFFu; (uint64_t)a + size <= s_top; a += 0x10000u) {
+        if (!range_is_free(a, a + size)) continue;
+        uint32_t b = a, sz = size, st = 0;
+        allocate_locked(&b, &sz, alloc_type, protect, &st);
+        if (st == 0) { *base = b; ok = 1; }
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_lock);
+    return ok;
+}

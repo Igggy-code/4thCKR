@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /*
  * kernel_xbox.c - Xbox Identity & Hardware Stubs
  *
@@ -11,6 +12,7 @@
 
 #include "kernel.h"
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 
 /* ============================================================================
@@ -222,7 +224,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     case XC_VIDEO:
         /* NTSC 4:3, 480i at 60 Hz. The old low-half-word value read as 0 (#301). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_60Hz;
+            /* XBOX_WIDESCREEN=1: the dashboard's 16:9 setting, for titles
+             * that render anamorphic widescreen when it is set. */
+            const char *ws = getenv("XBOX_WIDESCREEN");
+            *(PULONG)Value = XC_VIDEO_FLAGS_60Hz |
+                ((ws && *ws == '1') ? XC_VIDEO_FLAGS_WIDESCREEN : 0);
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -323,6 +329,22 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(Value, blk, sizeof blk);
         if (ValueLength > sizeof blk)
             memset((uint8_t *)Value + sizeof blk, 0, ValueLength - sizeof blk);
+        break;
+    }
+
+    case 0x100:   /* XC_FACTORY_SERIAL_NUMBER: 12 digits, from the MAC */
+    case 0x101: { /* XC_FACTORY_ETHERNET_ADDR: the NIC's (usb/nvnet.c), so
+                   * two phones are two consoles to System Link */
+        extern const uint8_t *xbox_NicMac(void);
+        const uint8_t *mac = xbox_NicMac();
+        uint8_t v[16];
+        ULONG n;
+        if (ValueIndex == 0x101) { memcpy(v, mac, 6); n = 6; }
+        else { snprintf((char *)v, sizeof v, "%02u%02u%02u%06u", mac[3] % 100, mac[4] % 100, mac[5] % 100, 0); n = 12; }
+        if (Type) *Type = 3;
+        if (ResultLength) *ResultLength = n;
+        if (ValueLength < n) return 0xC0000023L;
+        memcpy(Value, v, n);
         break;
     }
 

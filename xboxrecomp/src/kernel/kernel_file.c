@@ -1,3 +1,4 @@
+#include <time.h>
 /*
  * kernel_file.c - Xbox File I/O
  *
@@ -733,10 +734,24 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
         }
-        default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtQueryVolumeInformationFile: unhandled class %d", FsInformationClass);
+        case 1: {   /* FileFsVolumeInformation: polled hundreds of times a
+                     * second in some scenes -- each one a logged warning
+                     * before, a stall of its own */
+            if (Length < 18) return STATUS_INVALID_PARAMETER;
+            uint8_t *v = (uint8_t *)FsInformation;
+            memset(v, 0, Length < 24 ? Length : 24);
+            *(uint32_t *)(v + 8) = 0x434E4B52u;   /* serial */
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 18;
+            return STATUS_SUCCESS;
+        }
+        default: {
+            static unsigned warned;
+            if (warned++ < 8)
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "NtQueryVolumeInformationFile: unhandled class %d", FsInformationClass);
             return STATUS_NOT_IMPLEMENTED;
+        }
     }
 }
 
@@ -1211,8 +1226,22 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
-            mkdir(host_path, 0755);   /* EEXIST is fine */
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            /* EEXIST is fine. Missing parents are created too: a cache
+             * partition starts empty here, and Conker creates
+             * Z:\texture\frontend\tips without ever creating Z:\texture --
+             * a failure it reports as a dirty disc. */
+            if (mkdir(host_path, 0755) != 0 && errno == ENOENT) {
+                char tmp[1024];
+                size_t n = strlen(host_path);
+                if (n < sizeof tmp) {
+                    memcpy(tmp, host_path, n + 1);
+                    for (char *q = tmp + 1; *q; q++)
+                        if (*q == '/') { *q = 0; mkdir(tmp, 0755); *q = '/'; }
+                    mkdir(tmp, 0755);
+                }
+            }
+        }
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
         int flags = posix_open_flags(DesiredAccess, CreateDisposition);
@@ -1273,6 +1302,38 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+/* nv2a-port: disc read rate, for "a load is in progress" (the display
+ * pillarboxes loading screens on it). Bytes per 125 ms bucket, 8 buckets. */
+static volatile uint64_t s_io_bytes[8];
+static volatile int64_t s_io_bucket[8];
+static int64_t io_now_bucket(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return ((int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000) / 125;
+}
+static void io_account(size_t n)
+{
+    int64_t b = io_now_bucket();
+    int i = (int)(b & 7);
+    if (s_io_bucket[i] != b) { s_io_bucket[i] = b; s_io_bytes[i] = 0; }
+    s_io_bytes[i] += n;
+}
+char g_xbox_level_name[48];          /* level package being loaded */
+volatile unsigned g_xbox_level_seq;
+volatile uint32_t g_xbox_movie_handle;
+char g_xbox_movie_path[260];                 /* guest path of the last .xmv opened */
+volatile int64_t g_xbox_load_mark_ms;   /* see kernel_bridge.c NtCreateFile */
+volatile int64_t g_xbox_pause_file_ms;   /* the pause menu opened (kernel_bridge.c) */
+/* bytes read in the last ~0.5 s */
+uint64_t xbox_io_recent_bytes(void)
+{
+    int64_t b = io_now_bucket();
+    uint64_t sum = 0;
+    for (int i = 0; i < 8; i++)
+        if (b - s_io_bucket[i] < 4) sum += s_io_bytes[i];
+    return sum;
+}
+
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
@@ -1289,10 +1350,44 @@ NTSTATUS __stdcall xbox_NtReadFile(
     }
 
     overwrite_settle(fd);
+    /* an offset given: pread (one call, no shared file position between
+     * the seek and the read -- streams of one wave bank read the same
+     * handle from more than one thread), then leave the position after the
+     * data as NT does */
+    off_t at = -1;
     if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+        at = (off_t)ByteOffset->QuadPart;
 
-    ssize_t n = read(fd, Buffer, Length);
+    struct timespec rd_t0; clock_gettime(CLOCK_MONOTONIC, &rd_t0);
+#if defined(XBOXRECOMP_NV2A_XEMU)
+    {   /* read() into a write-watched guest page fails with EFAULT */
+        extern void xbox_GuestRamPrepareWrite(uint32_t va, uint32_t len);
+        extern ptrdiff_t g_xbox_mem_offset;
+        xbox_GuestRamPrepareWrite((uint32_t)((uintptr_t)Buffer - (uintptr_t)g_xbox_mem_offset),
+                                  (uint32_t)Length);
+    }
+#endif
+    struct timespec rd_t1; clock_gettime(CLOCK_MONOTONIC, &rd_t1);
+    ssize_t n = at >= 0 ? pread(fd, Buffer, Length, at) : read(fd, Buffer, Length);
+    if (at >= 0 && n >= 0) lseek(fd, at + n, SEEK_SET);
+    {   /* a read the game waits on for long (storage on a FUSE path, cold
+         * page cache): which file, how much, and how long, the in-game
+         * freeze hunt */
+        struct timespec rd_t2; clock_gettime(CLOCK_MONOTONIC, &rd_t2);
+        double prep = (rd_t1.tv_sec - rd_t0.tv_sec) * 1e3 + (rd_t1.tv_nsec - rd_t0.tv_nsec) / 1e6;
+        double rd = (rd_t2.tv_sec - rd_t1.tv_sec) * 1e3 + (rd_t2.tv_nsec - rd_t1.tv_nsec) / 1e6;
+        static int slow_logged;
+        if ((prep + rd > 20.0) && slow_logged < 400) {
+            slow_logged++;
+            char lp[64], path[300] = "?";
+            snprintf(lp, sizeof lp, "/proc/self/fd/%d", fd);
+            ssize_t pl = readlink(lp, path, sizeof path - 1);
+            if (pl > 0) path[pl] = 0;
+            const char *sh = strstr(path, "/game/");
+            fprintf(stderr, "[SLOWREAD] %.1f ms (guest-page prep %.1f ms) tid %d: %u bytes at %lld of %s\n",
+                    prep + rd, prep, (int)gettid(), (unsigned)Length, (long long)at, sh ? sh + 6 : path);
+        }
+    }
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1301,6 +1396,17 @@ NTSTATUS __stdcall xbox_NtReadFile(
     }
 
     IoStatusBlock->Information = (ULONG_PTR)n;
+    io_account((size_t)n);
+    if (n >= 22 && getenv("CONKER_OVERLAY")) {
+        /* A save's SaveMeta.xbx keeps the slot name it was created with
+         * ("Name=Game 1" from an English run); with the translation on, the
+         * default names read in the translated language ("Игра 1"), same
+         * length, the file itself untouched. */
+        static const uint16_t pat[] = { 0xFEFF, 'N','a','m','e','=', 'G','a','m','e',' ' };
+        static const uint16_t ru[] = { 0x0418, 0x0433, 0x0440, 0x0430 };   /* Игра */
+        uint16_t *w = (uint16_t *)Buffer;
+        if (!memcmp(w, pat, sizeof pat)) memcpy(w + 6, ru, sizeof ru);
+    }
     if (n == 0 && Length > 0) {
         IoStatusBlock->Status = STATUS_END_OF_FILE;
         return STATUS_END_OF_FILE;
@@ -1326,8 +1432,13 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     }
 
     overwrite_settle(fd);
+    /* an offset given: pread (one call, no shared file position between
+     * the seek and the read -- streams of one wave bank read the same
+     * handle from more than one thread), then leave the position after the
+     * data as NT does */
+    off_t at = -1;
     if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+        at = (off_t)ByteOffset->QuadPart;
 
     ssize_t n = write(fd, Buffer, Length);
     if (n < 0) {
@@ -1633,10 +1744,24 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
         }
-        default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtQueryVolumeInformationFile: unhandled class %d", FsInformationClass);
+        case 1: {   /* FileFsVolumeInformation: polled hundreds of times a
+                     * second in some scenes -- each one a logged warning
+                     * before, a stall of its own */
+            if (Length < 18) return STATUS_INVALID_PARAMETER;
+            uint8_t *v = (uint8_t *)FsInformation;
+            memset(v, 0, Length < 24 ? Length : 24);
+            *(uint32_t *)(v + 8) = 0x434E4B52u;   /* serial */
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 18;
+            return STATUS_SUCCESS;
+        }
+        default: {
+            static unsigned warned;
+            if (warned++ < 8)
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "NtQueryVolumeInformationFile: unhandled class %d", FsInformationClass);
             return STATUS_NOT_IMPLEMENTED;
+        }
     }
 }
 

@@ -438,7 +438,7 @@ extern uint32_t g_xbox_stack_size;
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
  * it. */
 #define XBOX_TIB_MAIN       0x00004000
-extern RECOMP_TLS uint32_t g_fs_base;
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_fs_base; */
 #define XBOX_FS_BASE        g_fs_base
 
 #define XBOX_STACK_BASE     g_xbox_stack_base

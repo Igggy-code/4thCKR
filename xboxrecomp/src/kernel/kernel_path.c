@@ -679,6 +679,19 @@ static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
 static char s_user_dir[MAX_PATH];   /* UDATA/TDATA/TitleCache root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL s_initialized = FALSE;
+static char s_overlay_dir[MAX_PATH];   /* files here replace the game dir's (a language patch) */
+
+/* A directory whose files take the place of the game dir's files of the same
+ * relative path (case folded). Empty or NULL turns it off. */
+void xbox_path_set_overlay(const char *dir)
+{
+    snprintf(s_overlay_dir, sizeof(s_overlay_dir), "%s", dir ? dir : "");
+    if (s_overlay_dir[0]) {
+        size_t n = strlen(s_overlay_dir);
+        if (n > 1 && s_overlay_dir[n - 1] == '/') s_overlay_dir[n - 1] = 0;
+    }
+    fprintf(stderr, "[PATH] overlay: %s\n", s_overlay_dir[0] ? s_overlay_dir : "(none)");
+}
 
 /* Strip a single trailing '/' (but never the root '/'). */
 static void strip_trailing_slash(char* s)
@@ -944,6 +957,17 @@ translate:
                 host_path_buf[--n] = '\0';
         }
         fold_case(host_path_buf, strlen(base_dir));
+
+        if (s_overlay_dir[0] && base_dir == s_game_dir && !sub_dir) {
+            char ov[MAX_PATH];
+            struct stat ost;
+            snprintf(ov, sizeof(ov), "%s/%s", s_overlay_dir, remainder_posix);
+            fold_case(ov, strlen(s_overlay_dir));
+            if (stat(ov, &ost) == 0 && S_ISREG(ost.st_mode)) {
+                snprintf(host_path_buf, buf_size, "%s", ov);
+                XBOX_TRACE(XBOX_LOG_PATH, "overlay %s", ov);
+            }
+        }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path

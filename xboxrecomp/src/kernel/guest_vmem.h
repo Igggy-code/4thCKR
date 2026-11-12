@@ -48,3 +48,4 @@ int guest_vmem_free(uint32_t *base, uint32_t *size, uint32_t free_type,
  *             State, Protect, Type } -- the 28-byte guest
  *             MEMORY_BASIC_INFORMATION layout. */
 int guest_vmem_query(uint32_t address, uint32_t info[7]);
+int guest_vmem_allocate_any(uint32_t size, uint32_t alloc_type, uint32_t protect, uint32_t *base);

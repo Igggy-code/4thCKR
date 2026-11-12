@@ -1,3 +1,4 @@
+#include <stdio.h>
 /*
  * kernel_memory.c - Xbox Memory Management
  *
@@ -186,6 +187,14 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     /* The same number can be a window page; record that the title meant RAM
      * (xbox_PhysNoteRamName says why the APU needs to know). */
     xbox_PhysNoteRamName(va);
+    {
+        static int logged;
+        if (logged < 40) {
+            logged++;
+            fprintf(stderr, "[MM] MmGetPhysicalAddress(0x%08X): not window memory, "
+                            "returned as-is\n", va);
+        }
+    }
     return (ULONG_PTR)va;
 }
 
