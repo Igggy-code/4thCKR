@@ -4134,6 +4134,27 @@ class Lifter:
                         f"{_fmt_operand_read(ops[0])};"
                         f" /* fldcw {insn.op_str} */"]
             return [f"/* fldcw {insn.op_str} - no source operand */"]
+        # FINCSTP / FDECSTP move TOP without touching any register or tag
+        # the model keeps; every st(i) after them is relative to the new TOP.
+        # Left as a comment, each following stack reference was one slot off
+        # (Conker's rotation-matrix builder sub_003E2E60 wrote a duplicated
+        # element into every camera matrix). FFREE only empties a tag.
+        # FXTRACT: st(0) <- exponent, then push the significand (in [1,2)).
+        if m == "fxtract":
+            return ["{ double _v = fp_top(), _sig, _ex; "
+                    "if (_v == 0.0) { _ex = -INFINITY; _sig = _v; } "
+                    "else if (isinf(_v)) { _ex = INFINITY; _sig = _v; } "
+                    "else if (isnan(_v)) { _ex = _v; _sig = _v; } "
+                    "else { int _e; _sig = frexp(_v, &_e) * 2.0; _ex = (double)(_e - 1); } "
+                    "fp_top() = _ex; fp_push(_sig); } /* fxtract */"]
+        if m == "fincstp":
+            return ["g_fp_top = (g_fp_top + 1u) & 7u; /* fincstp */"]
+        if m == "fdecstp":
+            return ["g_fp_top = (g_fp_top + 7u) & 7u; /* fdecstp */"]
+        if m in ("ffree", "ffreep"):
+            if m == "ffreep":
+                return [f"fp_pop(); /* ffreep {insn.op_str} */"]
+            return [f"/* ffree {insn.op_str}: tag only, no value change */"]
         if m == "fldz":
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
