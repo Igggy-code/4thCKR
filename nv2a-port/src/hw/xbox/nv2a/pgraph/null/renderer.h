@@ -21,10 +21,9 @@
 #define HW_XBOX_NV2A_PGRAPH_NULL_RENDERER_H
 
 #include "qemu/osdep.h"
-#include <epoxy/gl.h>
 
 struct PGRAPHNullState {
-    GLuint blank_texture;
+    unsigned int blank_texture;
 };
 
 #endif // HW_XBOX_NV2A_PGRAPH_NULL_RENDERER_H

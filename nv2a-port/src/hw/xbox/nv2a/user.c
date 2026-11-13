@@ -20,6 +20,7 @@
  */
 
 #include "nv2a_int.h"
+unsigned nv2a_user_reads;
 
 /* USER - PFIFO MMIO and DMA submission area */
 uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
@@ -28,6 +29,39 @@ uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
 
     unsigned int channel_id = addr >> 16;
     assert(channel_id < NV2A_NUM_CHANNELS);
+
+    /* nv2a-port: GET/PUT/REF without the PFIFO lock. A title spinning on
+     * GET (D3D waiting for the GPU to pass a fence) took the lock once per
+     * poll, tens of thousands of times a frame, and the PFIFO thread that
+     * has to advance GET kept blocking on it. Aligned 32-bit loads; the
+     * value may be a moment old, as on hardware. NV2A_USER_LOCKED=1. */
+    static int locked = -1;
+    if (locked < 0) locked = getenv("NV2A_USER_LOCKED") != NULL;
+    if (!locked) {
+        extern unsigned nv2a_user_reads;
+        nv2a_user_reads++;
+        uint32_t modes = __atomic_load_n(&d->pfifo.regs[NV_PFIFO_MODE], __ATOMIC_RELAXED);
+        uint32_t push1 = __atomic_load_n(&d->pfifo.regs[NV_PFIFO_CACHE1_PUSH1], __ATOMIC_RELAXED);
+        if ((modes & (1 << channel_id)) &&
+            channel_id == GET_MASK(push1, NV_PFIFO_CACHE1_PUSH1_CHID)) {
+            uint64_t v = 0;
+            switch (addr & 0xFFFF) {
+            case NV_USER_DMA_PUT:
+                v = __atomic_load_n(&d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT], __ATOMIC_ACQUIRE);
+                break;
+            case NV_USER_DMA_GET:
+                v = __atomic_load_n(&d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET], __ATOMIC_ACQUIRE);
+                break;
+            case NV_USER_REF:
+                v = __atomic_load_n(&d->pfifo.regs[NV_PFIFO_CACHE1_REF], __ATOMIC_ACQUIRE);
+                break;
+            default:
+                break;
+            }
+            nv2a_reg_log_read(NV_USER, addr, size, v);
+            return v;
+        }
+    }
 
     qemu_mutex_lock(&d->pfifo.lock);
 
@@ -91,6 +125,7 @@ void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         if (channel_id == cur_channel_id) {
             switch (addr & 0xFFFF) {
             case NV_USER_DMA_PUT:
+                { extern void nv2a_tl(int, uint32_t); nv2a_tl(3, (uint32_t)val); }
                 d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = val;
                 break;
             case NV_USER_DMA_GET:

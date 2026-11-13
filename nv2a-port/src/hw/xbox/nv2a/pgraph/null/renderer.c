@@ -22,13 +22,8 @@
 #include "qemu/thread.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 
-#include "gloffscreen.h"
-
-static GloContext *g_null_gl_context;
-
 static void early_context_init(void)
 {
-    g_null_gl_context = glo_context_create();
 }
 
 static void pgraph_null_init(NV2AState *d, Error **errp)
@@ -43,11 +38,6 @@ static void pgraph_null_finalize(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHNullState *r = pg->null_renderer_state;
     if (r) {
-        if (r->blank_texture) {
-            glo_set_current(g_null_gl_context);
-            glDeleteTextures(1, &r->blank_texture);
-            glo_set_current(NULL);
-        }
         g_free(r);
         pg->null_renderer_state = NULL;
     }
@@ -144,22 +134,8 @@ static void pgraph_null_surface_update(NV2AState *d, bool upload,
 
 static int pgraph_null_get_framebuffer_surface(NV2AState *d)
 {
-    PGRAPHState *pg = &d->pgraph;
-    PGRAPHNullState *r = pg->null_renderer_state;
-    if (r) {
-        if (!r->blank_texture) {
-            static const uint8_t black_pixel[4] = { 0, 0, 0, 255 };
-            glGenTextures(1, &r->blank_texture);
-            glBindTexture(GL_TEXTURE_2D, r->blank_texture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
-                         GL_UNSIGNED_BYTE, black_pixel);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        }
-
-        return r->blank_texture;
-    }
-
+    /* nv2a-port: no GL here; the host presents frames itself. */
+    (void)d;
     return 0;
 }
 
@@ -189,7 +165,9 @@ static PGRAPHRenderer pgraph_null_renderer = {
     },
 };
 
-static void __attribute__((constructor)) register_renderer(void)
+/* nv2a-port: called explicitly; a constructor in a static library is
+ * dropped by the linker when nothing else references the object. */
+void nv2a_register_null_renderer(void)
 {
     pgraph_renderer_register(&pgraph_null_renderer);
 }
