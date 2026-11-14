@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "ui/xemu-settings.h"
 #include "renderer.h"
+#include "hw/xbox/nv2a/pgraph/glsl/vsh.h"
 #include "xemu-version.h"
 
 #define VkExtensionPropertiesArray GArray
@@ -32,7 +33,10 @@ static char const *const validation_layers[] = {
 };
 
 static char const *const required_device_extensions[] = {
-#ifdef WIN32
+#if defined(__ANDROID__)
+    /* nv2a-port: frames are presented to the app's own swapchain. */
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+#elif defined(WIN32)
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
 #else
@@ -142,6 +146,12 @@ add_optional_instance_extension_names(PGRAPHState *pg,
         g_config.display.vulkan.validation_layers &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+#if defined(__ANDROID__)
+    add_extension_if_available(available_extensions, enabled_extension_names,
+                               VK_KHR_SURFACE_EXTENSION_NAME);
+    add_extension_if_available(available_extensions, enabled_extension_names,
+                               VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+#endif
 }
 
 #if defined(VK_API_VERSION_1_4)
@@ -152,12 +162,85 @@ add_optional_instance_extension_names(PGRAPHState *pg,
 #define MAX_VK_API_VERSION VK_API_VERSION_1_2
 #endif
 
+/* nv2a-port: a user-supplied Vulkan driver (an ICD such as Mesa Turnip for
+ * Adreno), named by NV2A_VK_DRIVER (the app copies it from files/driver/ to
+ * private storage, where it may be loaded). Used without the system loader:
+ * negotiate the ICD interface, then its vk_icdGetInstanceProcAddr stands in
+ * for vkGetInstanceProcAddr. Any failure falls back to the system driver. */
+#include <dlfcn.h>
+static PFN_vkGetInstanceProcAddr load_custom_driver(void)
+{
+    const char *path = getenv("NV2A_VK_DRIVER");
+    if (!path || !*path) return NULL;
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        fprintf(stderr, "[vk] custom driver %s: dlopen failed: %s\n", path, dlerror());
+        return NULL;
+    }
+    typedef VkResult (VKAPI_PTR *PFN_negotiate)(uint32_t *);
+    PFN_negotiate negotiate =
+        (PFN_negotiate)dlsym(h, "vk_icdNegotiateLoaderICDInterfaceVersion");
+    PFN_vkGetInstanceProcAddr gipa =
+        (PFN_vkGetInstanceProcAddr)dlsym(h, "vk_icdGetInstanceProcAddr");
+    if (!gipa) gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+    if (negotiate) {
+        uint32_t ver = 5;
+        if (negotiate(&ver) != VK_SUCCESS) {
+            fprintf(stderr, "[vk] custom driver %s: interface negotiation failed\n", path);
+            dlclose(h);
+            return NULL;
+        }
+        fprintf(stderr, "[vk] custom driver %s: ICD interface %u\n", path, ver);
+    }
+    if (!gipa) {
+        fprintf(stderr, "[vk] custom driver %s: no GetInstanceProcAddr\n", path);
+        dlclose(h);
+        return NULL;
+    }
+    return gipa;
+}
+
+/* nv2a-port: Turnip (or another Adreno driver package) through
+ * libadrenotools: the system Vulkan loader is loaded in its own linker
+ * namespace with hooks that swap the Adreno HAL for the custom driver, so
+ * it can use libhardware / libsync like the stock one. The app sets
+ * NV2A_ADRENO_DRIVER_DIR / _NAME (unpacked driver) and NV2A_ADRENO_HOOK_DIR
+ * (its native library dir, which holds the hook libraries). */
+extern void *adrenotools_open_libvulkan(int dlopenMode, int featureFlags, const char *tmpLibDir,
+                                        const char *hookLibDir, const char *customDriverDir,
+                                        const char *customDriverName, const char *fileRedirectDir,
+                                        void **userMappingHandle);
+int nv2a_custom_driver_active;
+static PFN_vkGetInstanceProcAddr load_adreno_driver(void)
+{
+    const char *dir = getenv("NV2A_ADRENO_DRIVER_DIR"), *name = getenv("NV2A_ADRENO_DRIVER_NAME");
+    const char *hooks = getenv("NV2A_ADRENO_HOOK_DIR");
+    if (!dir || !name || !hooks || !*dir || !*name) return NULL;
+    void *h = adrenotools_open_libvulkan(RTLD_NOW, 1 /* ADRENOTOOLS_DRIVER_CUSTOM */, NULL,
+                                         hooks, dir, name, NULL, NULL);
+    if (!h) {
+        fprintf(stderr, "[vk] adrenotools: %s%s did not load, system driver\n", dir, name);
+        return NULL;
+    }
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+    fprintf(stderr, "[vk] adrenotools: custom driver %s%s %s\n", dir, name, gipa ? "loaded" : "has no entry point");
+    return gipa;
+}
+
 static bool create_instance(PGRAPHState *pg, Error **errp)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
 
-    result = volkInitialize();
+    PFN_vkGetInstanceProcAddr custom_gipa = load_adreno_driver();
+    if (!custom_gipa) custom_gipa = load_custom_driver();
+    nv2a_custom_driver_active = custom_gipa != NULL;
+    if (custom_gipa) {
+        volkInitializeCustom(custom_gipa);
+        result = VK_SUCCESS;
+    } else {
+        result = volkInitialize();
+    }
     if (result != VK_SUCCESS) {
         error_setg(errp, "volkInitialize failed");
         return false;
@@ -335,6 +418,29 @@ static void add_optional_device_extension_names(
     r->custom_border_color_extension_enabled =
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    {   /* nv2a-port: list what the device offers, once */
+        fprintf(stderr, "[vk] device extensions:");
+        for (int i = 0; i < available_extensions->len; i++)
+            fprintf(stderr, " %s", g_array_index(available_extensions,
+                                                 VkExtensionProperties, i).extensionName);
+        fprintf(stderr, "\n");
+    }
+    r->image_robustness_enabled =
+        add_extension_if_available(available_extensions, enabled_extension_names,
+                                   "VK_EXT_image_robustness");
+    r->device_fault_enabled =
+        add_extension_if_available(available_extensions, enabled_extension_names,
+                                   "VK_EXT_device_fault");
+    r->image_compression_control_enabled = getenv("NV2A_NO_AFBC") &&
+        add_extension_if_available(available_extensions, enabled_extension_names,
+                                   "VK_EXT_image_compression_control");
+    if (getenv("NV2A_NO_AFBC"))
+        fprintf(stderr, "[vk] no-AFBC experiment: image_compression_control %s\n",
+                r->image_compression_control_enabled ? "available" : "missing, storage-usage fallback");
+    if (getenv("NV2A_NO_CBC")) {   /* nv2a-port experiment */
+        r->custom_border_color_extension_enabled = false;
+        fprintf(stderr, "[vk] custom border colours off\n");
+    }
 
     r->memory_budget_extension_enabled = add_extension_if_available(
         available_extensions, enabled_extension_names,
@@ -490,6 +596,15 @@ static bool select_physical_device(PGRAPHState *pg, Error **errp)
     xemu_settings_set_string(&g_config.display.vulkan.preferred_physical_device,
                              r->device_props.deviceName);
     r->vk_api_version = MIN(r->vk_api_version, r->device_props.apiVersion);
+    {
+        /* nv2a-port: ARM Mali's geometry shaders hang the GPU on xemu's
+         * triangle-depth shaders (DEVICE_LOST after ~8 s). Draw without them:
+         * quads become indexed triangles, depth comes from the vertex. */
+        const char *e = getenv("NV2A_VK_GS");
+        r->no_geometry_shader = e ? (*e == '0') : (r->device_props.vendorID == 0x13B5);
+        fprintf(stderr, "[vk] geometry shaders %s\n",
+                r->no_geometry_shader ? "off (GS-free path)" : "on");
+    }
 
     fprintf(stderr,
             "Selected physical device: %s\n"
@@ -556,12 +671,13 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
             .required = req, \
         }
         F(depthClamp, true),
-        F(fillModeNonSolid, true),
+        F(robustBufferAccess, false), /* nv2a-port: Mali faults (DEVICE_LOST) on OOB reads */
+        F(fillModeNonSolid, false),   /* nv2a-port: Mali lacks it; wireframe falls back to fill */
         F(geometryShader, true),
         F(occlusionQueryPrecise, true),
         F(samplerAnisotropy, false),
-        F(shaderClipDistance, true),
-        F(shaderTessellationAndGeometryPointSize, true),
+        F(shaderClipDistance, false), /* unused by the GLSL generator */
+        F(shaderTessellationAndGeometryPointSize, false), /* point size then stays 1 in GS pipelines */
         F(wideLines, false),
         #undef F
         // clang-format on
@@ -584,6 +700,16 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         return false;
     }
 
+    nv2a_glsl_clip_w = r->no_geometry_shader &&
+                       r->enabled_physical_device_features.shaderClipDistance &&
+                       !getenv("NV2A_NO_CLIP_W");
+    {
+        extern bool nv2a_glsl_zclip_w;
+        nv2a_glsl_zclip_w = !nv2a_glsl_clip_w && !getenv("NV2A_NO_ZCLIP_W");
+        fprintf(stderr, "[vk] clip at w=0: %s\n", nv2a_glsl_clip_w ? "on (clip distance)" :
+                nv2a_glsl_zclip_w ? "on (near plane)" : "off");
+    }
+
     void *next_struct = NULL;
 
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_features;
@@ -595,6 +721,35 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
             .pNext = next_struct,
         };
         next_struct = &custom_border_features;
+    }
+
+    VkPhysicalDeviceImageRobustnessFeaturesEXT img_robust_features;
+    if (r->image_robustness_enabled) {
+        img_robust_features = (VkPhysicalDeviceImageRobustnessFeaturesEXT){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT,
+            .robustImageAccess = VK_TRUE,
+            .pNext = next_struct,
+        };
+        next_struct = &img_robust_features;
+    }
+    VkPhysicalDeviceFaultFeaturesEXT fault_features;
+    if (r->device_fault_enabled) {
+        fault_features = (VkPhysicalDeviceFaultFeaturesEXT){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
+            .deviceFault = VK_TRUE,
+            .deviceFaultVendorBinary = VK_FALSE,
+            .pNext = next_struct,
+        };
+        next_struct = &fault_features;
+    }
+    VkPhysicalDeviceImageCompressionControlFeaturesEXT icc_features;
+    if (r->image_compression_control_enabled) {
+        icc_features = (VkPhysicalDeviceImageCompressionControlFeaturesEXT){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT,
+            .imageCompressionControl = VK_TRUE,
+            .pNext = next_struct,
+        };
+        next_struct = &icc_features;
     }
 
     VkDeviceCreateInfo device_create_info = {
@@ -621,6 +776,7 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
     }
 
     vkGetDeviceQueue(r->device, indices.queue_family, 0, &r->queue);
+    { extern void nv2a_rec_install(void); nv2a_rec_install(); }
     return true;
 }
 

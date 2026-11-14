@@ -21,6 +21,7 @@
 #include <math.h>
 
 #include "hw/xbox/nv2a/debug_gl.h"
+#include "nv2a_vk_present.h"
 
 static uint8_t *convert_texture_data__CR8YB8CB8YA8(uint8_t *data_out,
                                                    const uint8_t *data_in,
@@ -100,6 +101,8 @@ static void create_pvideo_image(PGRAPHState *pg, int width, int height)
     VmaAllocationCreateInfo alloc_create_info = {
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
     };
+    VkImageCompressionControlEXT nv2a_icc;
+    nv2a_vk_image_no_compress(r, &image_create_info, &nv2a_icc);
     VK_CHECK(vmaCreateImage(r->allocator, &image_create_info,
                             &alloc_create_info, &d->pvideo.image,
                             &d->pvideo.allocation, NULL));
@@ -144,6 +147,8 @@ static void upload_pvideo_image(PGRAPHState *pg, PvideoState state)
 
     // Copy texture data to mapped device buffer
     uint8_t *mapped_memory_ptr;
+
+    pgraph_vk_wait_deferred();
 
     VK_CHECK(vmaMapMemory(r->allocator,
                           r->storage_buffers[BUFFER_STAGING_SRC].allocation,
@@ -218,13 +223,97 @@ static const char *display_frag_glsl =
     "    vec3 pvideo_color_key;\n"
     "};\n"
     "layout(location = 0) out vec4 out_Color;\n"
+    /* nv2a-port: FXAA (edge search along the edge, after T. Lottes' FXAA
+     * 3.11 quality preset, sub-pixel part kept light so textures stay crisp).
+     * Analysed on the source texel grid, the result offset applied to the
+     * stretched coordinate. */
+    "float lu(vec2 p) { return dot(texture(tex, p).rgb, vec3(0.299, 0.587, 0.114)); }\n"
+    "vec3 fxaa(vec2 uv, vec2 px, out bool edge) {\n"
+    "    vec2 c0 = (floor(uv / px) + 0.5) * px;\n"
+    "    float lM = lu(c0), lN = lu(c0 + vec2(0, -px.y)), lS = lu(c0 + vec2(0, px.y));\n"
+    "    float lE = lu(c0 + vec2(px.x, 0)), lW = lu(c0 + vec2(-px.x, 0));\n"
+    "    float lMin = min(lM, min(min(lN, lS), min(lE, lW)));\n"
+    "    float lMax = max(lM, max(max(lN, lS), max(lE, lW)));\n"
+    "    float range = lMax - lMin;\n"
+    "    edge = range >= max(0.0312, lMax * 0.125);\n"
+    "    if (!edge) return texture(tex, uv).rgb;\n"
+    "    float lNW = lu(c0 + vec2(-px.x, -px.y)), lNE = lu(c0 + vec2(px.x, -px.y));\n"
+    "    float lSW = lu(c0 + vec2(-px.x, px.y)), lSE = lu(c0 + vec2(px.x, px.y));\n"
+    "    float eH = abs(-2.0*lW + lNW + lSW) + 2.0*abs(-2.0*lM + lN + lS) + abs(-2.0*lE + lNE + lSE);\n"
+    "    float eV = abs(-2.0*lN + lNW + lNE) + 2.0*abs(-2.0*lM + lW + lE) + abs(-2.0*lS + lSW + lSE);\n"
+    "    bool horz = eH >= eV;\n"
+    "    float stepLen = horz ? px.y : px.x;\n"
+    "    float l1 = horz ? lN : lW, l2 = horz ? lS : lE;\n"
+    "    float g1 = abs(l1 - lM), g2 = abs(l2 - lM);\n"
+    "    bool steep1 = g1 >= g2;\n"
+    "    float gs = 0.25 * max(g1, g2);\n"
+    "    float avg;\n"
+    "    if (steep1) { stepLen = -stepLen; avg = 0.5 * (l1 + lM); } else avg = 0.5 * (l2 + lM);\n"
+    "    vec2 cur = c0; if (horz) cur.y += stepLen * 0.5; else cur.x += stepLen * 0.5;\n"
+    "    vec2 off = horz ? vec2(px.x, 0) : vec2(0, px.y);\n"
+    "    vec2 p1 = cur - off, p2 = cur + off;\n"
+    "    float e1 = lu(p1) - avg, e2 = lu(p2) - avg;\n"
+    "    bool r1 = abs(e1) >= gs, r2 = abs(e2) >= gs;\n"
+    "    const float Q[10] = float[](1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 4.0, 8.0);\n"
+    "    for (int i = 0; i < 10 && !(r1 && r2); i++) {\n"
+    "        if (!r1) { p1 -= off * Q[i]; e1 = lu(p1) - avg; r1 = abs(e1) >= gs; }\n"
+    "        if (!r2) { p2 += off * Q[i]; e2 = lu(p2) - avg; r2 = abs(e2) >= gs; }\n"
+    "    }\n"
+    "    float d1 = horz ? c0.x - p1.x : c0.y - p1.y, d2 = horz ? p2.x - c0.x : p2.y - c0.y;\n"
+    "    bool dir1 = d1 < d2;\n"
+    "    float pixOff = -min(d1, d2) / (d1 + d2) + 0.5;\n"
+    "    bool correct = ((dir1 ? e1 : e2) < 0.0) != (lM < avg);\n"
+    "    float fo = correct ? pixOff : 0.0;\n"
+    "    float la = (2.0*(lN + lS + lE + lW) + lNW + lNE + lSW + lSE) / 12.0;\n"
+    "    float sb = clamp(abs(la - lM) / range, 0.0, 1.0);\n"
+    "    sb = (-2.0*sb + 3.0) * sb * sb;\n"
+    "    fo = max(fo, sb * sb * 0.5);\n"
+    "    vec2 q = uv; if (horz) q.y += fo * stepLen; else q.x += fo * stepLen;\n"
+    "    return texture(tex, q).rgb;\n"
+    "}\n"
     "void main()\n"
     "{\n"
     "    vec2 tex_coord = gl_FragCoord.xy/display_size;\n"
     "    float rel = display_size.y/textureSize(tex, 0).y/line_offset;\n"
     "    tex_coord.y = 1 + rel*(tex_coord.y - 1);\n"
     "    tex_coord.y = 1 - tex_coord.y;\n" // GL compat
-    "    out_Color.rgba = texture(tex, tex_coord);\n"
+    /* nv2a-port: light edge smoothing (FXAA-like, 5 taps) of the frame
+     * before it is stretched to the screen. The old contrast sharpening made
+     * the x1 picture grainy, with colour fringes on edges. Smooths across
+     * high-contrast edges only; flat areas and texture detail stay as they
+     * are. */
+    "    vec2 px = 1.0 / vec2(textureSize(tex, 0));\n"
+    "    vec3 c = texture(tex, tex_coord).rgb;\n"
+    "    vec3 n = texture(tex, tex_coord + vec2(0.0, -px.y)).rgb;\n"
+    "    vec3 s = texture(tex, tex_coord + vec2(0.0,  px.y)).rgb;\n"
+    "    vec3 e = texture(tex, tex_coord + vec2( px.x, 0.0)).rgb;\n"
+    "    vec3 w = texture(tex, tex_coord + vec2(-px.x, 0.0)).rgb;\n"
+    "    const vec3 L = vec3(0.299, 0.587, 0.114);\n"
+    "    float lc = dot(c, L), ln = dot(n, L), ls = dot(s, L), le = dot(e, L), lw = dot(w, L);\n"
+    "    float lmin = min(lc, min(min(ln, ls), min(le, lw)));\n"
+    "    float lmax = max(lc, max(max(ln, ls), max(le, lw)));\n"
+    "    float range = lmax - lmin;\n"
+    "    vec3 outc = c;\n"
+    "    bool aedge = false;\n"
+    "    if (AAON) outc = fxaa(tex_coord, px, aedge);\n"
+    "    if (aedge) {\n"
+    "    } else if (SMOOTH && range > max(0.05, 0.15 * lmax)) {\n"
+    "        bool horz = abs(ln + ls - 2.0 * lc) >= abs(le + lw - 2.0 * lc);\n"
+    "        vec3 across = horz ? (n + s) * 0.5 : (e + w) * 0.5;\n"
+    "        float lavg = (ln + ls + le + lw) * 0.25;\n"
+    "        float k = clamp(abs(lavg - lc) / range, 0.0, 1.0);\n"
+    "        k = smoothstep(0.0, 1.0, k) * 0.35;\n"
+    "        outc = mix(c, across, k);\n"
+    "    } else {\n"
+    /* texture detail away from hard edges: contrast-adaptive sharpening,
+     * strength from the settings (CONKER_SHARPNESS 0..3, medium default) */
+    "        vec3 mn = min(c, min(min(n, s), min(e, w)));\n"
+    "        vec3 mx = max(c, max(max(n, s), max(e, w)));\n"
+    "        vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));\n"
+    "        vec3 wt = -amp * SHARPK;\n"
+    "        outc = clamp((c + (n + s + e + w) * wt) / (1.0 + 4.0 * wt), 0.0, 1.0);\n"
+    "    }\n"
+    "    out_Color.rgba = vec4(outc, texture(tex, tex_coord).a);\n"
     "    if (pvideo_enable) {\n"
     "        vec2 screen_coord = vec2(gl_FragCoord.x, display_size.y - gl_FragCoord.y) * pvideo_scale.z;\n"
     "        vec4 output_region = vec4(pvideo_pos.xy, pvideo_pos.xy + pvideo_pos.zw);\n"
@@ -237,6 +326,48 @@ static const char *display_frag_glsl =
     "        }\n"
     "    }\n"
     "}\n";
+
+/* nv2a-port: the display shader with the sharpening strength filled in */
+/* the settings can change these while the game runs: the display pipeline
+ * is rebuilt on the next frame (nv2a_set_display_fx) */
+static char *s_disp_src;
+static int s_disp_sharp = -1, s_disp_aa = -1;
+static volatile int s_disp_fx_dirty;
+void nv2a_set_display_fx(int sharpness, int aa)
+{
+    s_disp_sharp = sharpness; s_disp_aa = aa;
+    __atomic_store_n(&s_disp_fx_dirty, 1, __ATOMIC_RELEASE);
+}
+
+static const char *display_frag_src(void)
+{
+    char *src = s_disp_src;
+    if (src) return src;
+    const char *e = getenv("CONKER_SHARPNESS");
+    if (s_disp_sharp < 0) s_disp_sharp = e ? atoi(e) : 3;
+    int lvl = s_disp_sharp;
+    static const char *k[] = { "0.0", "0.05", "0.09", "0.16" };
+    if (lvl < 0 || lvl > 3) lvl = 3;
+    /* 3 (High, the default): the original look, sharpening everywhere and
+     * no edge smoothing; 0..2 smooth the hard edges */
+    char *a = strdup(display_frag_glsl);
+    /* CONKER_AA=1 (the settings' Anti-aliasing, on by default): FXAA */
+    const char *aa = getenv("CONKER_AA");
+    if (s_disp_aa < 0) s_disp_aa = aa ? atoi(aa) != 0 : 1;
+    int aaon = s_disp_aa;
+    const char *reps[3][2] = { { "SHARPK", k[lvl] }, { "SMOOTH", lvl == 3 || aaon ? "false" : "true" },
+                               { "AAON", aaon ? "true" : "false" } };
+    for (int i = 0; i < 3; i++) {
+        char *at = strstr(a, reps[i][0]);
+        if (!at) continue;
+        size_t pre = at - a, kl = strlen(reps[i][1]), ol = strlen(reps[i][0]);
+        char *b = malloc(strlen(a) - ol + kl + 1);
+        memcpy(b, a, pre); memcpy(b + pre, reps[i][1], kl); strcpy(b + pre + kl, at + ol);
+        free(a); a = b;
+    }
+    s_disp_src = a;
+    return a;
+}
 
 static void create_descriptor_pool(PGRAPHState *pg)
 {
@@ -377,7 +508,7 @@ static void create_display_pipeline(PGRAPHState *pg)
 
     r->display.display_frag =
         pgraph_vk_create_shader_module_from_glsl(
-            r, VK_SHADER_STAGE_FRAGMENT_BIT, display_frag_glsl);
+            r, VK_SHADER_STAGE_FRAGMENT_BIT, display_frag_src());
 
     VkPipelineShaderStageCreateInfo shader_stages[] = {
         (VkPipelineShaderStageCreateInfo){
@@ -580,7 +711,6 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         destroy_current_display_image(pg);
     }
 
-    const GLint gl_internal_format = GL_RGBA8;
     bool use_optimal_tiling = true;
 
 #if HAVE_EXTERNAL_MEMORY
@@ -614,11 +744,13 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
         .format = VK_FORMAT_R8G8B8A8_UNORM,
         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
 
+#if HAVE_EXTERNAL_MEMORY
     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
 #ifdef WIN32
@@ -628,6 +760,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
 #endif
     };
     image_create_info.pNext = &external_memory_image_create_info;
+#endif
 
     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
 
@@ -643,6 +776,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
     };
 
+#if HAVE_EXTERNAL_MEMORY
     VkExportMemoryAllocateInfo export_memory_alloc_info = {
         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
         .handleTypes =
@@ -654,6 +788,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
             ,
     };
     alloc_info.pNext = &export_memory_alloc_info;
+#endif
 
     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
@@ -863,6 +998,7 @@ static PvideoState get_pvideo_state(PGRAPHState *pg)
 
 static void update_uniforms(PGRAPHState *pg, SurfaceBinding *surface)
 {
+    FRAME_SCALE_SCOPE(pg, surface);
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     PGRAPHVkState *r = pg->vk_renderer_state;
     ShaderUniformLayout *l = &r->display.display_frag->push_constants;
@@ -899,6 +1035,7 @@ static void update_uniforms(PGRAPHState *pg, SurfaceBinding *surface)
 
 static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
 {
+    FRAME_SCALE_SCOPE(pg, surface);
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     PGRAPHVkState *r = pg->vk_renderer_state;
     PGRAPHVkDisplayState *disp = &r->display;
@@ -908,17 +1045,68 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
         pgraph_vk_finish(pg, VK_FINISH_REASON_PRESENTING);
     }
 
-    pgraph_vk_upload_surface_data(d, surface, !tcg_enabled());
+    /* nv2a-port: only when the CPU wrote the scanout memory (upload_pending);
+     * forcing it re-uploaded stale RAM over the GPU's frame. */
+    bool cpu_written = surface->upload_pending;
+    pgraph_vk_upload_surface_data(d, surface, false);
+    if (cpu_written && r->in_command_buffer) {
+        /* the upload may be recorded in the frame's command buffer: it has
+         * to run before the composite reads the surface */
+        pgraph_vk_finish(pg, VK_FINISH_REASON_PRESENTING);
+    }
 
     disp->pvideo.state = get_pvideo_state(pg);
     if (disp->pvideo.state.enabled) {
         upload_pvideo_image(pg, disp->pvideo.state);
     }
 
+    /* nv2a-port: the composite goes in its own command buffer, queued
+     * behind the frame that drew the surface, instead of a one-off
+     * submission drained with vkQueueWaitIdle: that wait was for the whole
+     * frame just submitted, and the PFIFO thread could not start recording
+     * the next one meanwhile. Only a surface the CPU wrote (upload) or the
+     * overlay takes the old path. NV2A_SYNC_DISPLAY=1 always does. */
+    static int sync_disp = -1;
+    if (sync_disp < 0) sync_disp = getenv("NV2A_SYNC_DISPLAY") != NULL;
+    static VkCommandBuffer s_dcmd;
+    static VkFence s_dfence;
+    static bool s_dpending;
+    bool async = !sync_disp && !disp->pvideo.state.enabled;
+    if (async && !s_dcmd) {
+        VkCommandBufferAllocateInfo ai = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = r->command_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        if (vkAllocateCommandBuffers(r->device, &ai, &s_dcmd) != VK_SUCCESS ||
+            vkCreateFence(r->device, &fi, NULL, &s_dfence) != VK_SUCCESS) {
+            s_dcmd = VK_NULL_HANDLE;
+            async = false;
+        }
+    }
+    if (s_dpending) {   /* the descriptor set and buffer are reused */
+        vkWaitForFences(r->device, 1, &s_dfence, VK_TRUE, UINT64_MAX);
+        vkResetFences(r->device, 1, &s_dfence);
+        s_dpending = false;
+    }
+
     update_uniforms(pg, surface);
     update_descriptor_set(pg, surface);
 
-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+    VkCommandBuffer cmd;
+    if (async) {
+        vkResetCommandBuffer(s_dcmd, 0);
+        VkCommandBufferBeginInfo bi = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        VK_CHECK(vkBeginCommandBuffer(s_dcmd, &bi));
+        cmd = s_dcmd;
+    } else {
+        cmd = pgraph_vk_begin_single_time_commands(pg);
+    }
     pgraph_vk_begin_debug_marker(r, cmd, RGBA_YELLOW,
         "Display Surface %08"HWADDR_PRIx, surface->vram_addr);
 
@@ -997,7 +1185,19 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     pgraph_vk_end_debug_marker(r, cmd);
-    pgraph_vk_end_single_time_commands(pg, cmd);
+    if (async) {
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo si = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+        };
+        VK_CHECK(vkQueueSubmit(r->queue, 1, &si, s_dfence));
+        s_dpending = true;
+        nv2a_site_hit("disp:async", 0, 0, 0);
+    } else {
+        pgraph_vk_end_single_time_commands(pg, cmd);
+    }
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
 
     disp->draw_time = surface->draw_time;
@@ -1046,6 +1246,7 @@ void pgraph_vk_init_display(PGRAPHState *pg)
 
 void pgraph_vk_finalize_display(PGRAPHState *pg)
 {
+    nv2a_vk_present_finalize(pg);
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     destroy_pvideo_image(pg);
@@ -1066,11 +1267,46 @@ void pgraph_vk_render_display(PGRAPHState *pg)
     NV2AState *d = container_of(pg, NV2AState, pgraph);
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    {   /* new sharpness / anti-aliasing from the settings: a new display
+         * shader and pipeline; the old ones are destroyed 16 frames later,
+         * when no frame in flight can still use them (no GPU wait) */
+        static VkPipeline old_pipe; static VkPipelineLayout old_layout;
+        static ShaderModuleInfo *old_frag; static int old_age;
+        if (old_pipe && ++old_age > 16) {
+            vkDestroyPipeline(r->device, old_pipe, NULL);
+            vkDestroyPipelineLayout(r->device, old_layout, NULL);
+            pgraph_vk_destroy_shader_module(r, old_frag);
+            old_pipe = VK_NULL_HANDLE; old_layout = VK_NULL_HANDLE; old_frag = NULL;
+        }
+        if (!old_pipe && r->display.pipeline &&
+            __atomic_exchange_n(&s_disp_fx_dirty, 0, __ATOMIC_ACQ_REL)) {
+            old_pipe = r->display.pipeline; old_layout = r->display.pipeline_layout;
+            old_frag = r->display.display_frag; old_age = 0;
+            free(s_disp_src); s_disp_src = NULL;
+            create_display_pipeline(pg);
+            fprintf(stderr, "[DISP] display shader rebuilt: sharpness %d, AA %d\n",
+                    s_disp_sharp, s_disp_aa);
+        }
+    }
+
     VGADisplayParams vga_display_params;
     d->vga.get_params(&d->vga, &vga_display_params);
 
     SurfaceBinding *surface = pgraph_vk_surface_get_within(
         d, d->pcrtc.start + vga_display_params.line_offset);
+    {
+        extern int nv2a_framelog_on;
+        static unsigned last_start = ~0u; static int nlog;
+        unsigned st = d->pcrtc.start + vga_display_params.line_offset;
+        if (nv2a_framelog_on || (st != last_start && nlog < 200)) {
+            nlog++; last_start = st;
+            fprintf(stderr, "[DISP] pcrtc %08x off %u -> surf %08x %ux%u color=%d dirty=%d\n",
+                    (unsigned)d->pcrtc.start, (unsigned)vga_display_params.line_offset,
+                    surface ? (unsigned)surface->vram_addr : 0, surface ? surface->width : 0,
+                    surface ? surface->height : 0, surface ? surface->color : -1,
+                    surface ? surface->draw_dirty : -1);
+        }
+    }
     if (surface == NULL || !surface->color || !surface->width ||
         !surface->height) {
         return;
@@ -1084,6 +1320,7 @@ void pgraph_vk_render_display(PGRAPHState *pg)
         height *= 2;
     }
 
+    FRAME_SCALE_SCOPE(pg, NULL);   /* the scanout is frame-sized */
     pgraph_apply_scaling_factor(pg, &width, &height);
 
     PGRAPHVkDisplayState *disp = &r->display;
@@ -1091,5 +1328,24 @@ void pgraph_vk_render_display(PGRAPHState *pg)
         create_display_image(pg, width, height);
     }
 
+    /* nv2a-port: the display is asked for at every vblank; at 10-30 fps
+     * most asks see the same scanout surface, unchanged. Each composite
+     * was a one-off submission drained with vkQueueWaitIdle -- several full
+     * GPU stalls per game frame. Skip it (and the present of the same
+     * image) when nothing changed. NV2A_DISP_ALWAYS=1 re-renders. */
+    static int always = -1;
+    if (always < 0) always = getenv("NV2A_DISP_ALWAYS") != NULL;
+    static SurfaceBinding *last_s; static hwaddr last_addr;
+    static unsigned last_dt; static int last_valid;
+    PvideoState pv = get_pvideo_state(pg);
+    if (!always && last_valid && surface == last_s &&
+        surface->vram_addr == last_addr && surface->draw_time == last_dt &&
+        !surface->upload_pending && !pv.enabled) {
+        nv2a_site_hit("disp:same", 0, surface->width, surface->height);
+        return;
+    }
     render_display(pg, surface);
+    nv2a_vk_present(pg, disp->image, disp->width, disp->height);
+    last_s = surface; last_addr = surface->vram_addr;
+    last_dt = surface->draw_time; last_valid = 1;
 }
