@@ -1,3 +1,6 @@
+#include <dlfcn.h>
+#include <pthread.h>
+#include <time.h>
 /*
  * kernel_hal.c - Hardware Abstraction Layer
  *
@@ -52,7 +55,7 @@ static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
  * critical section, blocked against the thread that held it, and the title
  * froze with IRQL raised on the blocked thread. Every change of
  * g_current_irql is published here. */
-extern RECOMP_TLS uint32_t g_fs_base;
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_fs_base; */
 /* The offset lifted code adds to every guest address; host code that reads
  * guest memory on its behalf uses the same one. */
 extern ptrdiff_t g_xbox_mem_offset;
@@ -133,7 +136,7 @@ static struct {
     void *ra;
     uint32_t guest_ra, guest_esp;   /* the host ra only ever names the bridge */
 } s_holders[IRQL_HOLDERS];
-extern RECOMP_TLS uint32_t g_esp;
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_esp; */
 
 static void irql_holder_add(void *ra)
 {
@@ -350,7 +353,7 @@ static int s_dpc_on;            /* RECOMP_DPC_ON_RAISE, under the gate */
 static XBOX_THREAD_LOCAL int t_guest_thread;
 static XBOX_THREAD_LOCAL int t_in_dpc;
 static uint64_t s_irq_wait_ns;
-static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci" };
+static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci", "nic" };
 
 static struct {
     volatile LONG posted[XBOX_IRQ_LINES], on_holder[XBOX_IRQ_LINES],
@@ -476,15 +479,15 @@ static void irq_note_wait(int line, uint64_t posted_ns)
  * keeps in these across a call is put back. g_fs_base stays: the
  * routine runs on the holder's TIB, as on the console's one CPU (a device
  * model's thread as holder: see irq_release_point). */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp;
-extern RECOMP_TLS uint32_t g_seh_ebp, g_eflags;
-extern RECOMP_TLS int g_df, g_fp_top, g_fp_cmp;
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc;
-extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
-extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_seh_ebp, g_eflags; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS int g_df, g_fp_top, g_fp_cmp; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS double g_fp_stack[8]; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7; */
 
 typedef struct {
     uint32_t eax, ecx, edx, ebx, esi, edi, ebp, esp, seh_ebp, eflags;
@@ -710,8 +713,15 @@ static void irq_wait_check(uint64_t now)
             (long)s_irq_points_refused);
     for (i = 0; i < IRQL_HOLDERS; i++)
         if ((unsigned long)s_holders[i].tid == tid && tid)
+        {
+            Dl_info di;
             fprintf(stderr, ", raised from host %p, guest ret %08X",
                     s_holders[i].ra, s_holders[i].guest_ra);
+            if (s_holders[i].ra && dladdr(s_holders[i].ra, &di) && di.dli_sname)
+                fprintf(stderr, " (in %s+0x%lx, IRQL now %d)", di.dli_sname,
+                        (unsigned long)((uintptr_t)s_holders[i].ra - (uintptr_t)di.dli_saddr),
+                        (int)g_current_irql);
+        }
     fprintf(stderr, "%s\n", s_irq_force ? "; RECOMP_IRQ_SAFE_FORCE delivers it"
                                         : "; a guest loop here makes no "
                                           "kernel call");
@@ -1061,9 +1071,18 @@ static void xbox_update_tick_count(void)
  * Both Xbox and Windows return LARGE_INTEGER.
  * ============================================================================ */
 
+/* nv2a-port: set by a title hook around a busy-wait that polls the counter
+ * (Conker's D3D_BlockOnTime spins on it while the GPU catches up: three
+ * quarters of a big core, the heat that throttled it to half clock). Each
+ * poll then naps first, so the wait sleeps instead of spinning. */
+__thread int g_xbox_spin_nap_us;
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
+    if (g_xbox_spin_nap_us) {
+        struct timespec nap = { 0, (long)g_xbox_spin_nap_us * 1000L };
+        nanosleep(&nap, NULL);
+    }
     QueryPerformanceCounter(&counter);
     return counter;
 }
@@ -1141,12 +1160,56 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
  * of microseconds. Used for hardware timing (e.g., waiting for GPU).
  * ============================================================================ */
 
+/* nv2a-port: who stalls, how long (reported with [GPERF]) */
+static struct { uint32_t ra; uint32_t us; unsigned n; double total_us; } s_stall[8];
+void xbox_stall_report(double frames)
+{
+    for (int i = 0; i < 8 && s_stall[i].n; i++) {
+        fprintf(stderr, "[GPERF]   KeStall from guest 0x%08X (%u us): %.1f/frame, %.2f ms/frame\n",
+                s_stall[i].ra, s_stall[i].us, s_stall[i].n / frames,
+                s_stall[i].total_us / 1000.0 / frames);
+    }
+    memset(s_stall, 0, sizeof s_stall);
+}
+
 VOID __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds)
 {
     LARGE_INTEGER freq, start, now;
 
     if (MicroSeconds == 0)
         return;
+    {
+        /* the bridge leaves esp at the arguments: the return address is
+         * the word below them */
+        uint32_t ra = 0;
+        if (g_esp) {
+            uint32_t *sp = (uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+            ra = sp[0] == MicroSeconds ? sp[-1] : sp[0];
+        }
+        int k;
+        for (k = 0; k < 8 && s_stall[k].n && !(s_stall[k].ra == ra && s_stall[k].us == MicroSeconds); k++) ;
+        if (k < 8) { s_stall[k].ra = ra; s_stall[k].us = MicroSeconds; s_stall[k].n++;
+                     s_stall[k].total_us += MicroSeconds; }
+    }
+    /* A long stall sleeps instead of spinning a big core: the spin burns
+     * the CPU+GPU power budget the Mali needs. The last 100 us still spin
+     * for precision. CONKER_STALL_SPIN=1: always spin. */
+    static long cap = -2;   /* CONKER_STALL_CAP_US: experiment, cap the stall */
+    if (cap == -2) { const char *e = getenv("CONKER_STALL_CAP_US"); cap = e ? atol(e) : -1; }
+    if (cap >= 0 && MicroSeconds > (ULONG)cap) MicroSeconds = (ULONG)cap;
+    if (MicroSeconds == 0) return;
+    static int spin = -1;
+    if (spin < 0) spin = getenv("CONKER_STALL_SPIN") != NULL;
+    if (!spin && MicroSeconds >= 300) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        struct timespec nap = { 0, (long)(MicroSeconds - 100) * 1000L };
+        nanosleep(&nap, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long done = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
+        if (done >= (long)MicroSeconds) return;
+        MicroSeconds -= (ULONG)done;
+    }
 
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
@@ -1262,6 +1325,10 @@ VOID __stdcall xbox_HalReadWritePCISpace(
  * exit the game cleanly.
  * ============================================================================ */
 
+/* The host's say in how a title ends (a front end may restart it rather
+ * than run the process's exit handlers under a live UI). Default: nothing. */
+__attribute__((weak)) void xbox_title_exit_hook(unsigned routine) { (void)routine; }
+
 VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
@@ -1269,6 +1336,8 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
     /* stderr too: the kernel log file is rewritten on every run, so a title
      * that ends itself otherwise leaves no trace in the run's own log. */
     fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
+    fflush(stderr);
+    xbox_title_exit_hook((unsigned)Routine);
     ExitProcess(0);
 }
 
@@ -1774,8 +1843,42 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
  * ========================================================================= */
 #define XBOX_TSC_HZ 733333333ull
 
+/* nv2a-port: who reads the clock and how often (CONKER_TSCPROF=1): a site
+ * that reads it once a frame is the title's frame timer. [TSCPROF] / 10 s */
+#include <dlfcn.h>
+static struct { void *ra; unsigned n; } s_tscp[32];
+static void tsc_prof(void *ra)
+{
+    static int on = -1; static time_t t0;
+    if (on < 0) on = getenv("CONKER_TSCPROF") != NULL;
+    if (!on) return;
+    static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mx);
+    int k, fr = -1;
+    for (k = 0; k < 32; k++) { if (s_tscp[k].n && s_tscp[k].ra == ra) break; if (!s_tscp[k].n && fr < 0) fr = k; }
+    if (k == 32) k = fr;
+    if (k >= 0) { s_tscp[k].ra = ra; s_tscp[k].n++; }
+    time_t tn = time(NULL);
+    if (!t0) t0 = tn;
+    if (tn - t0 >= 10) {
+        char line[1200]; int o = 0;
+        for (int r = 0; r < 8; r++) {
+            int b = -1;
+            for (int j = 0; j < 32; j++) if (s_tscp[j].n && (b < 0 || s_tscp[j].n > s_tscp[b].n)) b = j;
+            if (b < 0) break;
+            Dl_info di; const char *nm = "?";
+            if (dladdr(s_tscp[b].ra, &di) && di.dli_sname) nm = di.dli_sname;
+            o += snprintf(line + o, sizeof line - o, " %s %.1f/s;", nm, s_tscp[b].n / (double)(tn - t0));
+            s_tscp[b].n = 0;
+        }
+        fprintf(stderr, "[TSCPROF]%s\n", line);
+        memset(s_tscp, 0, sizeof s_tscp); t0 = tn;
+    }
+    pthread_mutex_unlock(&mx);
+}
 uint64_t xbox_ReadTimeStampCounter(void)
 {
+    tsc_prof(__builtin_return_address(0));
     static LARGE_INTEGER freq;
     static LARGE_INTEGER origin;
     LARGE_INTEGER now;
@@ -1785,6 +1888,10 @@ uint64_t xbox_ReadTimeStampCounter(void)
         QueryPerformanceCounter(&origin);
         if (freq.QuadPart == 0)
             freq.QuadPart = 1;
+    }
+    if (g_xbox_spin_nap_us) {   /* a hooked busy-wait: nap per poll */
+        struct timespec nap = { 0, (long)g_xbox_spin_nap_us * 1000L };
+        nanosleep(&nap, NULL);
     }
     QueryPerformanceCounter(&now);
 
@@ -1933,4 +2040,75 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
         out[3] = 0x0C040800u;   /* L1 D, DTLB 4M, L1 I, no L2 */
         break;
     }
+}
+
+/* The GPU stops at a NOP/notify trap until the title's interrupt handler (or
+ * the DPC it queues) acknowledges it; a wait of hundreds of milliseconds there
+ * froze the picture. Who held the one-CPU gate at that moment, and whether a
+ * DPC or an interrupt was still waiting to run, names the cause. */
+#include <dlfcn.h>
+static void debug_holders_named(void)
+{
+    int i;
+    for (i = 0; i < IRQL_HOLDERS; i++) {
+        Dl_info di;
+        if (!s_holders[i].tid) continue;
+        if (s_holders[i].ra && dladdr(s_holders[i].ra, &di) && di.dli_sname)
+            fprintf(stderr, "  [HOLDER] tid %ld raised in %s+0x%lx\n", (long)s_holders[i].tid, di.dli_sname,
+                    (unsigned long)((uintptr_t)s_holders[i].ra - (uintptr_t)di.dli_saddr));
+    }
+}
+void xbox_DebugNopStall(double waited_ms)
+{
+    extern int xbox_DpcPending(void);
+    fprintf(stderr, "[NOPSTALL] GPU waited %.0f ms for the title's ack: gate owner tid %lu, "
+            "DPC pending %d, IRQ lines pending 0x%lx\n",
+            waited_ms, xbox_DispatchGateOwner(), xbox_DpcPending(), (unsigned long)s_irq_pending);
+    xbox_IrqlDumpHolders();
+    debug_holders_named();
+    fflush(stderr);
+}
+/* The GPU idle for long in play: the title sent nothing. Same picture. */
+void xbox_DebugIdleStall(double waited_ms)
+{
+    extern int xbox_DpcPending(void);
+    fprintf(stderr, "[IDLESTALL] GPU idle %.0f ms, nothing from the title: gate owner tid %lu, "
+            "DPC pending %d, IRQ lines pending 0x%lx\n",
+            waited_ms, xbox_DispatchGateOwner(), xbox_DpcPending(), (unsigned long)s_irq_pending);
+    xbox_IrqlDumpHolders();
+    debug_holders_named();
+    fflush(stderr);
+}
+
+/* A DPC kept waiting by a holder that polls the clock. The title's thread
+ * can sit at DISPATCH polling the time while it waits for the GPU; the GPU in
+ * turn waits for the very DPC that acknowledges its notify trap, and that
+ * DPC runs only where the holder lowers or releases the one-CPU gate. The
+ * two waited on each other until the title's own timeout, a freeze of
+ * 250-500 ms (the GPU's "nop/irq wait", gate owner = the title's thread,
+ * DPC pending = 1). A thread polling the clock is waiting, not in the middle
+ * of a critical region, so a DPC older than 2 ms is run here, at that poll.
+ * CONKER_NO_POLL_DPC=1 turns it off. */
+void xbox_DpcPollPoint(void)
+{
+    extern uint64_t xbox_DpcPendingSinceNs(void);
+    static int off = -1;
+    uint64_t since = xbox_DpcPendingSinceNs();
+    if (!since)
+        return;
+    if (off < 0)
+        off = getenv("CONKER_NO_POLL_DPC") != NULL;
+    if (off || !t_gate_depth || t_in_dpc || t_in_isr || g_current_irql > DISPATCH_LEVEL)
+        return;
+    if (xbox_HostNowNs() - since < 2000000ull)
+        return;
+    {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) <= 10) {
+            fprintf(stderr, "  [DPC] run at a clock poll of the gate holder (waited %.1f ms)\n",
+                    (double)(xbox_HostNowNs() - since) / 1e6);
+            fflush(stderr);
+        }
+    }
+    dpc_run_here();
 }

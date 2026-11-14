@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+void xbox_DpcPollPoint(void);   /* kernel_hal.c */
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
@@ -43,6 +44,7 @@
 /* Section B string helpers: wcslen helper, case folding.
  * ctype.h/wctype.h are not pulled in by the platform headers on either host. */
 #include <string.h>
+#include <time.h>
 #include <ctype.h>
 #include <wctype.h>
 
@@ -50,10 +52,10 @@
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
  * here binds to the TLS template rather than the calling thread's copy, which
  * reads as every register being zero. */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi; */
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
-extern RECOMP_TLS uint32_t g_seh_ebp;
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_seh_ebp; */
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* Dispatch table lookup (for function pointer args) */
@@ -94,8 +96,28 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
         return 0;
     if (end <= mapped)
         return 1;
-    return va >= XBOX_CONTIG_BASE
-        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    if (va >= XBOX_CONTIG_BASE
+        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 1;
+    /* The extended-VMA range (RECOMP_EXT_VMA) sits above the RAM mirrors and
+     * is backed only where the title committed it. A buffer there is fine if
+     * every page it touches is committed -- and it may well span several
+     * adjacent allocations: Conker's CRT heap grows region by region and
+     * reads a file straight across the seam. */
+    if (guest_vmem_active() && va >= mapped) {
+        uint32_t at = va & ~0xFFFu;
+        while ((uint64_t)at < end) {
+            uint32_t info[7];
+            if (!guest_vmem_query(at, info) || info[4] != 0x1000u /* MEM_COMMIT */
+                || !info[3])
+                return 0;
+            if ((uint64_t)info[0] + info[3] >= end)
+                return 1;
+            at = info[0] + info[3];
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot
@@ -265,6 +287,28 @@ static void kernel_data_init(void)
             }
         } else {
             BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
+            /* A title relaunching itself (XLaunchNewImage of its own image) is
+             * a quick reboot on the console, and the launch data page lives
+             * through it: the title comes back up, sees it was launched by
+             * itself, and carries on (Conker after loading a save goes on into
+             * the level). Here the relaunch is a new process, so the page was
+             * saved to a file on the way out and is put back now. */
+            const char *rf = getenv("XBOX_RELAUNCH_FILE");
+            FILE *f = rf ? fopen(rf, "rb") : NULL;
+            if (f) {
+                uint8_t buf[0x1000];
+                size_t n = fread(buf, 1, sizeof buf, f);
+                fclose(f);
+                remove(rf);
+                uint32_t page = n == sizeof buf ? xbox_HeapAlloc(0x1000, 4096) : 0;
+                if (page) {
+                    for (uint32_t i = 0; i < 0x1000; i++) BRIDGE_MEM8(page + i) = buf[i];
+                    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page;
+                    fprintf(stderr, "  [KERNEL] relaunched: launch data page restored at 0x%08X "
+                                    "(type %d titleid 0x%08X)\n", page,
+                            (int)BRIDGE_MEM32(page), BRIDGE_MEM32(page + 4));
+                }
+            }
         }
     }
 
@@ -987,6 +1031,11 @@ static void bridge_NtClose(void)
 
     bridge_forget_async_handle(raw_handle);
     thobj_detach_token(raw_handle);
+    {
+        extern volatile uint32_t g_xbox_movie_handle;
+        if (raw_handle && raw_handle == g_xbox_movie_handle)
+            g_xbox_movie_handle = 0;
+    }
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -1286,6 +1335,25 @@ static void bridge_NtAllocateVirtualMemory(void)
      * commits little, and it fails loudly and later rather than silently and
      * at startup if one does not. */
     uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* The heap (one contiguous pool inside the console's 64 MB) could not
+     * back it -- over a long session it fragments, and a title's CRT heap then
+     * cannot grow: Conker's malloc failed on a level load after ten minutes
+     * and the title rebooted itself. The extended VMA above the mirrors is
+     * distinct memory the host commits on demand; the CPU-side heap does not
+     * need it to be physical. */
+    if (!xbox_va && guest_vmem_active()) {
+        uint32_t vb = 0;
+        if (guest_vmem_allocate_any(size, alloc_type ? alloc_type : 0x3000u, protect ? protect : 4u, &vb)) {
+            static unsigned n_ext;
+            if (n_ext++ < 32)
+                fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: heap full, %u KB "
+                                "from the extended VMA at 0x%08X\n", size / 1024, vb);
+            if (base_ptr) BRIDGE_MEM32(base_ptr) = vb;
+            if (size_ptr) BRIDGE_MEM32(size_ptr) = (size + 4095) & ~4095u;
+            g_eax = 0;
+            return;
+        }
+    }
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
          * space above RAM, where it costs no heap and the pages are distinct.
@@ -1320,6 +1388,10 @@ static void bridge_NtAllocateVirtualMemory(void)
         }
     }
     if (!xbox_va) {
+        extern void xbox_HeapReportState(const char *why);
+        fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: NO MEMORY for %u bytes (type 0x%X)\n",
+                size, alloc_type);
+        xbox_HeapReportState("NtAllocateVirtualMemory failed");
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
@@ -1785,6 +1857,18 @@ static void bridge_HalReturnToFirmware(void)
             for (i = 0; i < 8; i++)
                 fprintf(stderr, " %08X", BRIDGE_MEM32(page + 1024 + i * 4));
             fprintf(stderr, "\n");
+            /* kept for the relaunched process (see the boot side) */
+            const char *rf = getenv("XBOX_RELAUNCH_FILE");
+            if (routine == 2 && rf) {
+                FILE *f = fopen(rf, "wb");
+                if (f) {
+                    uint8_t buf[0x1000];
+                    for (i = 0; i < 0x1000; i++) buf[i] = BRIDGE_MEM8(page + i);
+                    fwrite(buf, 1, sizeof buf, f);
+                    fclose(f);
+                    fprintf(stderr, "  [KERNEL] launch data page saved for the relaunch\n");
+                }
+            }
         } else {
             fprintf(stderr, "  [KERNEL] no launch data page set\n");
         }
@@ -1926,6 +2010,7 @@ static void bridge_RtlLeaveCriticalSection(void)
 /* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
 static void bridge_KeQueryPerformanceCounter(void)
 {
+    xbox_DpcPollPoint();
     LARGE_INTEGER li = xbox_KeQueryPerformanceCounter();
     g_eax = (uint32_t)li.LowPart;
     g_edx = (uint32_t)li.HighPart;
@@ -1941,6 +2026,7 @@ static void bridge_KeQueryPerformanceFrequency(void)
 /* ── KeQuerySystemTime (ordinal 128) ─────────────────────── */
 static void bridge_KeQuerySystemTime(void)
 {
+    xbox_DpcPollPoint();
     uint32_t time_ptr = STACK_ARG(0);
     xbox_KeQuerySystemTime(XBOX_TO_NATIVE(time_ptr));
     g_eax = 0;
@@ -2035,7 +2121,47 @@ static void bridge_KeSetEvent(void)
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
-static void bridge_KeWaitForSingleObject(void)
+
+#include <pthread.h>
+/* nv2a-port: who waits, how often, how long (per guest call site) --
+ * finds the title's frame limiter. [WAITPROF] every 10 s, top 8. */
+#include <time.h>
+static struct { uint32_t ra; uint8_t kind; unsigned n; uint64_t ns; } s_wp[64];
+static pthread_mutex_t s_wp_mx = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t s_wp_t0;
+static const char *s_wp_names[] = { "KeWaitSingle", "NtWaitSingle", "NtWaitSingleEx", "NtWaitMultiEx", "KeDelay", "KeWaitMulti", "BlockOnTime" };
+static uint64_t wp_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
+void xbox_wait_prof(uint32_t ra, uint64_t ns, int kind);
+static void wait_prof(uint32_t ra, uint64_t ns, int kind) { xbox_wait_prof(ra, ns, kind); }
+void xbox_wait_prof(uint32_t ra, uint64_t ns, int kind)
+{
+    pthread_mutex_lock(&s_wp_mx);
+    int k, free_k = -1;
+    for (k = 0; k < 64; k++) {
+        if (s_wp[k].n && s_wp[k].ra == ra && s_wp[k].kind == kind) break;
+        if (!s_wp[k].n && free_k < 0) free_k = k;
+    }
+    if (k == 64) k = free_k;
+    if (k >= 0) { s_wp[k].ra = ra; s_wp[k].kind = (uint8_t)kind; s_wp[k].n++; s_wp[k].ns += ns; }
+    uint64_t t = wp_now();
+    if (!s_wp_t0) s_wp_t0 = t;
+    if (t - s_wp_t0 > 10000000000ull) {
+        double sec = (t - s_wp_t0) / 1e9;
+        char line[1400]; int o = 0;
+        for (int r = 0; r < 8; r++) {
+            int best = -1;
+            for (int j = 0; j < 64; j++) if (s_wp[j].n && (best < 0 || s_wp[j].ns > s_wp[best].ns)) best = j;
+            if (best < 0) break;
+            o += snprintf(line + o, sizeof line - o, " %s@%08X %.1f/s %.2fms avg;", s_wp_names[s_wp[best].kind],
+                          s_wp[best].ra, s_wp[best].n / sec, s_wp[best].ns / 1e6 / s_wp[best].n);
+            s_wp[best].n = 0;
+        }
+        fprintf(stderr, "[WAITPROF]%s\n", line);
+        memset(s_wp, 0, sizeof s_wp); s_wp_t0 = t;
+    }
+    pthread_mutex_unlock(&s_wp_mx);
+}
+static void bridge_KeWaitForSingleObject_inner(void)
 {
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
@@ -2043,6 +2169,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+    { extern void nv2a_tl(int, uint32_t); nv2a_tl(31, g_xbox_kernel_caller); }
 
     {   /* An event the title built itself (see ke_guest_event). Its
          * SignalState in guest memory is the truth -- XDK code resets it by
@@ -2069,6 +2196,12 @@ static void bridge_KeWaitForSingleObject(void)
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
 }
+static void bridge_KeWaitForSingleObject(void)
+{
+    uint32_t ra_ = g_xbox_kernel_caller; uint64_t t0_ = wp_now();
+    bridge_KeWaitForSingleObject_inner();
+    wait_prof(ra_, wp_now() - t0_, 0);
+}
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
 /*
@@ -2077,7 +2210,7 @@ static void bridge_KeWaitForSingleObject(void)
  * "return 0" default (STATUS_SUCCESS = "already signalled"), so the read handshake
  * completed before the data arrived and the UI-map precache never made progress.
  */
-static void bridge_NtWaitForSingleObject(void)
+static void bridge_NtWaitForSingleObject_inner(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
@@ -2087,6 +2220,12 @@ static void bridge_NtWaitForSingleObject(void)
         return;
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+}
+static void bridge_NtWaitForSingleObject(void)
+{
+    uint32_t ra_ = g_xbox_kernel_caller; uint64_t t0_ = wp_now();
+    bridge_NtWaitForSingleObject_inner();
+    wait_prof(ra_, wp_now() - t0_, 1);
 }
 
 /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
@@ -2132,7 +2271,7 @@ static void bridge_NtPulseEvent(void)
  */
 static HANDLE bridge_resolve_handle(uint32_t token);
 
-static void bridge_NtWaitForSingleObjectEx(void)
+static void bridge_NtWaitForSingleObjectEx_inner(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t wait_mode   = STACK_ARG(1);
@@ -2152,6 +2291,12 @@ static void bridge_NtWaitForSingleObjectEx(void)
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+}
+static void bridge_NtWaitForSingleObjectEx(void)
+{
+    uint32_t ra_ = g_xbox_kernel_caller; uint64_t t0_ = wp_now();
+    bridge_NtWaitForSingleObjectEx_inner();
+    wait_prof(ra_, wp_now() - t0_, 2);
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -2189,7 +2334,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
  * bogus Count would otherwise read arbitrary guest memory onto the stack;
  * MAXIMUM_WAIT_OBJECTS is the real kernel's own limit.
  */
-static void bridge_NtWaitForMultipleObjectsEx(void)
+static void bridge_NtWaitForMultipleObjectsEx_inner(void)
 {
     uint32_t count       = STACK_ARG(0);
     uint32_t handles_va  = STACK_ARG(1);
@@ -2225,6 +2370,12 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
         count, handles, wait_type, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+}
+static void bridge_NtWaitForMultipleObjectsEx(void)
+{
+    uint32_t ra_ = g_xbox_kernel_caller; uint64_t t0_ = wp_now();
+    bridge_NtWaitForMultipleObjectsEx_inner();
+    wait_prof(ra_, wp_now() - t0_, 3);
 }
 
 /*
@@ -2323,7 +2474,7 @@ static void bridge_NtUserIoApcDispatcher(void)
 /* ── KeDelayExecutionThread (ordinal 99) ─────────────────── */
 /* Unbridged this returned instantly, turning every "sleep and retry" in the
  * title into a hot spin. Halo's cache-partition setup retries this way. */
-static void bridge_KeDelayExecutionThread(void)
+static void bridge_KeDelayExecutionThread_inner(void)
 {
     uint32_t wait_mode    = STACK_ARG(0);
     uint32_t alertable    = STACK_ARG(1);
@@ -2332,9 +2483,18 @@ static void bridge_KeDelayExecutionThread(void)
 
     if (bridge_run_io_apcs(alertable, wait_mode))
         return;
+    extern void nv2a_tl(int, uint32_t);
+    nv2a_tl(29, g_xbox_kernel_caller);
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(interval_ptr));
+    nv2a_tl(30, interval_ptr ? BRIDGE_MEM32(interval_ptr) : 0);
+}
+static void bridge_KeDelayExecutionThread(void)
+{
+    uint32_t ra_ = g_xbox_kernel_caller; uint64_t t0_ = wp_now();
+    bridge_KeDelayExecutionThread_inner();
+    wait_prof(ra_, wp_now() - t0_, 4);
 }
 
 /* ── KeBugCheck (ordinal 95) / KeBugCheckEx (96) ─────────── */
@@ -2441,6 +2601,12 @@ static void bridge_AvSetDisplayMode(void)
         xbox_SetDisplayFramebuffer(fb_va, pitch);
     }
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
+#if defined(XBOXRECOMP_NV2A_XEMU)
+    {
+        extern void xbox_Nv2aXemuSetDisplayMode(uint32_t, uint32_t, uint32_t, uint32_t);
+        xbox_Nv2aXemuSetDisplayMode(mode, format, pitch, fb);
+    }
+#endif
     g_eax = 0;
 }
 
@@ -2560,7 +2726,10 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+        extern void nv2a_tl(int, uint32_t);
+        nv2a_tl(22, routine);
         { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+        nv2a_tl(23, routine);
         callback_regs_restore(&saved, 0);
     }
     return 1;
@@ -2681,6 +2850,9 @@ static void dpc_lock(void)
     EnterCriticalSection(&g_dpc_lock);
 }
 
+static volatile uint64_t g_dpc_since_ns;
+uint64_t xbox_DpcPendingSinceNs(void) { return g_dpc_head != g_dpc_tail ? g_dpc_since_ns : 0; }
+
 int xbox_DpcQueue(uint32_t dpc, uint32_t arg1, uint32_t arg2)
 {
     LONG tail, next;
@@ -2694,6 +2866,8 @@ int xbox_DpcQueue(uint32_t dpc, uint32_t arg1, uint32_t arg2)
         return 0;
     }
     tail = g_dpc_tail;
+    if (g_dpc_head == tail)
+        g_dpc_since_ns = xbox_HostNowNs();   /* the oldest queued DPC's age */
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
     if (next == g_dpc_head) {
         LeaveCriticalSection(&g_dpc_lock);
@@ -2721,6 +2895,7 @@ int xbox_DpcPending(void)
 
 static void bridge_KeInsertQueueDpc(void)
 {
+    { extern void nv2a_tl(int, uint32_t); nv2a_tl(28, BRIDGE_MEM32(STACK_ARG(0) + 0xC)); }
     g_eax = (uint32_t)xbox_DpcQueue(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
 }
 
@@ -4240,6 +4415,63 @@ static NTSTATUS bridge_create_file_impl(
                 gpath[k] = name.Buffer[k];
             gpath[len] = 0;
         }
+        /* nv2a-port: a level package or a loading-screen background being
+         * opened marks a load: the display holds the 4:3 loading screen
+         * from here (not from when the reads get heavy, seconds later). */
+        if (!status && strstr(gpath, "zpackage\\Level\\")) {
+            /* the level's name, for the pipeline prewarm (nv2a draw.c) */
+            extern char g_xbox_level_name[48];
+            extern volatile unsigned g_xbox_level_seq;
+            const char *ln = strstr(gpath, "zpackage\\Level\\") + 15;
+            char nm[48]; int k = 0;
+            while (ln[k] && ln[k] != '\\' && k < 47) { nm[k] = ln[k]; k++; }
+            nm[k] = 0;
+            if (strcmp(nm, g_xbox_level_name)) {
+                memcpy(g_xbox_level_name, nm, k + 1);
+                g_xbox_level_seq++;
+            }
+        }
+        /* nv2a-port: an open .xmv is a movie playing. Its decoder runs on
+         * the guest CPU, and the pipeline prewarm (nv2a draw.c) waits for it
+         * to close rather than take cores from it: building the menu's
+         * pipelines during the boot intro made the intro stutter. */
+        if (!status && handle_va) {
+            size_t gl = strlen(gpath);
+            if (gl > 4 && !strcasecmp(gpath + gl - 4, ".xmv")) {
+                extern volatile uint32_t g_xbox_movie_handle;
+                g_xbox_movie_handle = BRIDGE_MEM32(handle_va);
+                { extern char g_xbox_movie_path[260];
+                  snprintf(g_xbox_movie_path, sizeof g_xbox_movie_path, "%s", gpath); }
+                /* who opens it: code addresses on the guest stack (the
+                 * movie player's frames, for a native player hook) */
+                {
+                    char sb[600]; int so = 0;
+                    for (int k = 0; k < 96 && so < 560; k++) {
+                        uint32_t v = BRIDGE_MEM32(g_esp + k * 4);
+                        if (v >= 0x00011000u && v < 0x00560000u)
+                            so += snprintf(sb + so, sizeof sb - so, " +%d:%08X", k * 4, v);
+                    }
+                    fprintf(stderr, "[MOVIE] open %s handle %08X esp %08X stack%s\n",
+                            gpath, (unsigned)g_xbox_movie_handle, (unsigned)g_esp, sb);
+                }
+            }
+        }
+        if (!status && strstr(gpath, "zpackage\\Level\\")) {
+            extern volatile int g_conker_in_level;
+            g_conker_in_level = strstr(gpath, "\\Frontend\\") == NULL;
+        }
+        /* Conker: the pause menu reads its text on every opening (from
+         * gameplay or a cutscene): the pause screen's surest sign */
+        if (!status && strstr(gpath, "\\UIPause\\")) {
+            extern volatile int64_t g_xbox_pause_file_ms;
+            struct timespec _t; clock_gettime(CLOCK_MONOTONIC, &_t);
+            g_xbox_pause_file_ms = (int64_t)_t.tv_sec * 1000 + _t.tv_nsec / 1000000;
+        }
+        if (!status && strstr(gpath, "zpackage\\Level\\") && !strstr(gpath, "\\Frontend\\")) {
+            extern volatile int64_t g_xbox_load_mark_ms;
+            struct timespec _t; clock_gettime(CLOCK_MONOTONIC, &_t);
+            g_xbox_load_mark_ms = (int64_t)_t.tv_sec * 1000 + _t.tv_nsec / 1000000;
+        }
         if (status) {
             /* Once a path has its "[FILE] missing" line, its later attempts
              * are counted rather than printed: a looping stream re-opens a
@@ -4759,7 +4991,12 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
-        if (poff)
+        /* every read, one line: off unless asked for (CONKER_READ_LOG=1) --
+         * it pushed everything else out of the phones' log buffer */
+        static int rlog = -1;
+        if (rlog < 0) rlog = getenv("CONKER_READ_LOG") != NULL;
+        if (!rlog) { }
+        else if (poff)
             fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
@@ -5809,6 +6046,7 @@ static void bridge_IoDeleteDevice(void)
  * half goes to g_edx exactly like the performance-counter bridges. */
 static void bridge_KeQueryInterruptTime(void)
 {
+    xbox_DpcPollPoint();
     uint64_t t = xbox_KeQueryInterruptTime();
 
     g_eax = (uint32_t)t;
@@ -5880,7 +6118,7 @@ static void bridge_KeAlertThread(void)
  * before the native wait sees it. */
 #define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
 
-static void bridge_KeWaitForMultipleObjects(void)
+static void bridge_KeWaitForMultipleObjects_inner(void)
 {
     uint32_t count      = STACK_ARG(0);
     uint32_t objects_va = STACK_ARG(1);
@@ -5924,6 +6162,12 @@ static void bridge_KeWaitForMultipleObjects(void)
              (wait_type != 0 && g_eax < count && g_eax == i)))
             BRIDGE_MEM32(guest_events[i] + 4) = 0;
     }
+}
+static void bridge_KeWaitForMultipleObjects(void)
+{
+    uint32_t ra_ = g_xbox_kernel_caller; uint64_t t0_ = wp_now();
+    bridge_KeWaitForMultipleObjects_inner();
+    wait_prof(ra_, wp_now() - t0_, 5);
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
