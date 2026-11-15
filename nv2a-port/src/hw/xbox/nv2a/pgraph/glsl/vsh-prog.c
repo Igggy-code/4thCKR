@@ -30,6 +30,9 @@
 
 #include <stdio.h>
 #include <string.h>
+
+/* nv2a-port: see the end of pgraph_glsl_gen_vsh_prog; 0 = off. */
+float nv2a_hor_scale;
 #include <stdbool.h>
 #include <assert.h>
 
@@ -324,7 +327,7 @@ static MString *decode_opcode_input(const uint32_t *shader_token,
         reg_num = convert_c_register(vsh_get_field(shader_token, FLD_CONST));
         if (vsh_get_field(shader_token, FLD_A0X) > 0) {
             //FIXME: does this really require the "correction" doe in convert_c_register?!
-            snprintf(tmp, sizeof(tmp), "c[A0+%d]", reg_num);
+            snprintf(tmp, sizeof(tmp), "c[clamp(A0+%d, 0, 191)]", reg_num);
         } else {
             snprintf(tmp, sizeof(tmp), "c[%d]", reg_num);
         }
@@ -781,6 +784,21 @@ void pgraph_glsl_gen_vsh_prog(uint16_t version, const uint32_t *tokens,
         "  vec4 vtxPos = oPos;\n"
         "  oPos.xy = (2.0f * oPos.xy - surfaceSize) / surfaceSize;\n"
         "  oPos.z = oPos.z / clipRange.y;\n"
+    );
+    /* nv2a-port: horizontal widening for screens wider than the title's
+     * 16:9 (nv2a_hor_scale = (16/9) / screen aspect, < 1). Perspective
+     * geometry (w != 1) drawn to a full-size target is pulled toward the
+     * centre so the presenter's stretch to the screen restores its shape and
+     * shows more at the sides; 2D (w = 1) and small targets (shadow maps)
+     * are left alone. */
+    {
+        extern float nv2a_hor_scale;
+        if (nv2a_hor_scale > 0.0f && nv2a_hor_scale < 0.999f)
+            mstring_append_fmt(body,
+                "  if (surfaceSize.x >= 600.0 && abs(vtxPos.w - 1.0) > 1.0e-4) oPos.x *= %.6f;\n",
+                nv2a_hor_scale);
+    }
+    mstring_append(body,
 
         /* Undo perspective divide by w.
          * Note that games may also have vertex shaders that do

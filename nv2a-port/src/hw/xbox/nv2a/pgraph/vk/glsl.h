@@ -39,6 +39,8 @@ typedef struct ShaderUniformLayout {
 	size_t num_uniforms;
 	size_t total_size;
 	void *allocation;
+	bool dirty;        /* nv2a-port: a value changed since the last upload */
+	uint32_t c_gen;    /* nv2a-port: vertex constants generation it holds */
 } ShaderUniformLayout;
 
 static inline void uniform_std140(ShaderUniformLayout *layout)
@@ -133,11 +135,27 @@ static inline void uniform_copy(ShaderUniformLayout *layout, int idx,
     char *p_max = p_out + layout->total_size;
     char *p_in = (char *)values;
 
+    /* nv2a-port: tightly packed array (vec4 elements at std140 stride):
+     * one copy, not one per element -- this runs for every uniform of every
+     * draw (the 192 vertex shader constants among them) */
+    if (u->stride == element_size && bytes_remaining % element_size == 0) {
+        assert(bytes_remaining / element_size <= (size_t)u->dim_a);
+        assert(p_out + bytes_remaining <= p_max);
+        if (memcmp(p_out, p_in, bytes_remaining)) {
+            memcpy(p_out, p_in, bytes_remaining);
+            layout->dirty = true;
+        }
+        return;
+    }
+
     int index = 0;
     while (bytes_remaining) {
         assert((p_out + element_size) <= p_max);
         assert(index < u->dim_a);
-        memcpy(p_out, p_in, element_size);
+        if (memcmp(p_out, p_in, element_size)) {
+            memcpy(p_out, p_in, element_size);
+            layout->dirty = true;
+        }
         bytes_remaining -= element_size;
         p_out += u->stride;
         p_in += element_size;

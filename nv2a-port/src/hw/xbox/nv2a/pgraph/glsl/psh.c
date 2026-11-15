@@ -1,3 +1,5 @@
+#include <time.h>
+#include <stdlib.h>
 /*
  * QEMU Geforce NV2A pixel shader translation
  *
@@ -80,8 +82,30 @@ static inline bool point_sprite_mode_enabled(PGRAPHState *pg)
            polygon_mode_front == NV_PGRAPH_SETUPRASTER_FRONTFACEMODE_POINT;
 }
 
+int nv2a_dbg_mode_now(void)
+{
+    static int n = -1, modes[16];
+    if (n < 0) {
+        n = 0;
+        const char *e = getenv("NV2A_DBG_CYCLE");
+        if (e && !strcmp(e, "1")) e = "311,0";
+        while (e && *e && n < 16) {
+            modes[n++] = atoi(e);
+            e = strchr(e, ',');
+            if (e) e++;
+        }
+    }
+    if (!n) return 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    int m = modes[(ts.tv_sec / 4) % n];
+    static int last = -1;
+    if (m != last) { last = m; fprintf(stderr, "[AB] dbg=%d\n", m); }
+    return m;
+}
+
 void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
 {
+    state->dbg = nv2a_dbg_mode_now();
     state->window_clip_exclusive = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                                    NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE;
     state->combiner_control = pgraph_reg_r(pg, NV_PGRAPH_COMBINECTL);
@@ -92,6 +116,7 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
 
     state->alpha_test = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
                         NV_PGRAPH_CONTROL_0_ALPHATESTENABLE;
+    if (state->dbg & 16) state->alpha_test = false;
     state->alpha_func = (enum PshAlphaFunc)GET_MASK(
         pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0), NV_PGRAPH_CONTROL_0_ALPHAFUNC);
 
@@ -997,6 +1022,7 @@ static MString* psh_convert(struct PixelShader *ps)
         );
 
     MString *clip = mstring_new();
+    if (!(ps->state->dbg & 1)) {
     mstring_append_fmt(clip, "/*  Window-clip (%slusive) */\n",
                        ps->state->window_clip_exclusive ? "Exc" : "Inc");
     if (!ps->state->window_clip_exclusive) {
@@ -1021,6 +1047,7 @@ static MString* psh_convert(struct PixelShader *ps)
                              "  discard;\n"
                              "}\n");
     }
+    }
 
     if (ps->state->z_perspective) {
         mstring_append(
@@ -1041,13 +1068,25 @@ static MString* psh_convert(struct PixelShader *ps)
             "bc1 *= inv_bcsum;\n"
             "bc2 *= inv_bcsum;\n"
             "precise float zvalue = vtxPos0.w + (bc1*(vtxPos1.w - vtxPos0.w) + bc2*(vtxPos2.w - vtxPos0.w));\n"
+            /* nv2a-port: without a geometry shader vtxPos0..2 are all the
+             * provoking vertex: zvalue was its w for the whole triangle, and
+             * depth clipping discarded whole floor triangles whose first
+             * vertex lay behind the near plane -- black holes under the
+             * camera. The interpolated w instead. */
+            "if (triMZ < 0.0) zvalue = vtxWs;\n"
             // If GPU clipping is inaccurate, the point gl_FragCoord.xy might
             // be above the horizon of the plane of a rasterized triangle
             // making the interpolated w-coordinate above zero or negative. We
             // should prevent such wrapping through infinity by clamping to
             // infinity.
+            /* nv2a-port: without a geometry shader triMZ is -1: the slope
+             * of 1/w per (unscaled) pixel from the derivatives instead */
+            "float nv2a_iw = zvalue > 0.0 ? 1.0 / zvalue : 0.0;\n"
+            "vec2 nv2a_dq = vec2(dFdx(nv2a_iw), dFdy(nv2a_iw)) * surfaceScale;\n"
+            "float nv2a_tmz = triMZ >= 0.0 ? triMZ : max(abs(nv2a_dq.x), abs(nv2a_dq.y));\n"
+            "if (isnan(nv2a_tmz) || isinf(nv2a_tmz)) nv2a_tmz = 0.0;\n"
             "if (zvalue > 0.0) {\n"
-            "  float zslopeofs = depthFactor*triMZ*zvalue*zvalue;\n"
+            "  float zslopeofs = depthFactor*nv2a_tmz*zvalue*zvalue;\n"
             "  zvalue += depthOffset;\n"
             "  zvalue += zslopeofs;\n"
             "} else {\n"
@@ -1072,16 +1111,29 @@ static MString* psh_convert(struct PixelShader *ps)
             "bc1 *= inv_bcsum;\n"
             "bc2 *= inv_bcsum;\n"
             "precise float zvalue = vtxPos0.z + (bc1*(vtxPos1.z - vtxPos0.z) + bc2*(vtxPos2.z - vtxPos0.z));\n"
+            "if (triMZ < 0.0) zvalue = vtxZs / vtxWs;\n"
+            "vec2 nv2a_dz = vec2(dFdx(zvalue), dFdy(zvalue)) * surfaceScale;\n"
+            "float nv2a_tmz = triMZ >= 0.0 ? triMZ : max(abs(nv2a_dz.x), abs(nv2a_dz.y));\n"
+            "if (isnan(nv2a_tmz) || isinf(nv2a_tmz)) nv2a_tmz = 0.0;\n"
             "zvalue += depthOffset;\n"
-            "zvalue += depthFactor*triMZ;\n");
+            "zvalue += depthFactor*nv2a_tmz;\n");
     }
 
     /* Depth clipping */
-    if (ps->state->depth_clipping) {
+    if (ps->state->depth_clipping && !(ps->state->dbg & 2)) {
         mstring_append(
-            clip, "if (zvalue < clipRange.z || clipRange.w < zvalue) {\n"
-                  "  discard;\n"
-                  "}\n");
+            clip,
+            /* nv2a-port: without a geometry shader zvalue is an interpolated
+             * varying, and next to the far limit (2^24 for D24) one float
+             * step is a whole depth unit: the skybox, whose corners behind
+             * the camera sit exactly at the limit, rounded past it on every
+             * other few rows and was discarded there -- the striped sky.
+             * A margin of 1e-5 of the range on that path; then clamp. */
+            "float nv2a_zeps = triMZ < 0.0 ? max(abs(clipRange.w), 1.0) * 1.0e-5 : 0.0;\n"
+            "if (zvalue < clipRange.z - nv2a_zeps || clipRange.w + nv2a_zeps < zvalue) {\n"
+            "  discard;\n"
+            "}\n"
+            "zvalue = clamp(zvalue, clipRange.z, clipRange.w);\n");
     } else {
         mstring_append(
             clip, "zvalue = clamp(zvalue, clipRange.z, clipRange.w);\n");
@@ -1212,6 +1264,8 @@ static MString* psh_convert(struct PixelShader *ps)
             }
 
             mstring_append_fmt(vars, "dsdt%d = bumpMat[%d] * dsdt%d;\n", i, i, i);
+            if (getenv("NV2A_BUMP_ZERO"))   /* A/B: the striped sky */
+                mstring_append_fmt(vars, "dsdt%d = vec2(0.0);\n", i);
 
             if (ps->state->dim_tex[i] == 2) {
                 mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, %s(pT%d.xy + dsdt%d));\n",
@@ -1519,29 +1573,50 @@ static MString* psh_convert(struct PixelShader *ps)
      * due to rounding.)
      */
 
+    if (ps->state->zeta_bound)
+        mstring_append(ps->code, "float nv2a_fd;\n");
+    if (!ps->state->zeta_bound) {
+        /* no depth attachment: nothing to write (see PshState.zeta_bound) */
+    } else
     switch (ps->state->depth_format) {
     case DEPTH_FORMAT_D16:
         // 16-bit unsigned int
         mstring_append(
             ps->code,
-            "gl_FragDepth = floor(zvalue) / 65535.0;\n");
+            "nv2a_fd = floor(zvalue) / 65535.0;\n");
         break;
     case DEPTH_FORMAT_D24:
         // 24-bit unsigned int
         mstring_append(
             ps->code,
-            "gl_FragDepth = uintBitsToFloat(floatBitsToUint(floor(zvalue) / 16777216.0) + 1u);\n");
+            "nv2a_fd = uintBitsToFloat(floatBitsToUint(floor(zvalue) / 16777216.0) + 1u);\n");
         break;
     default:
         // TODO: handle floating-point depth buffers properly
-        mstring_append(ps->code, "gl_FragDepth = zvalue / clipRange.y;\n");
+        mstring_append(ps->code, "nv2a_fd = zvalue / clipRange.y;\n");
         break;
+    }
+    if (ps->state->dbg & 8)
+        mstring_append(ps->code, "fragColor = vec4(1.0, 0.0, 1.0, 1.0);\n");
+    if (ps->state->dbg & 256)
+        mstring_append(ps->code, "fragColor = vtxD0;\n");
+    if (ps->state->zeta_bound) {
+        /* nv2a-port: never hand the depth unit NaN/inf or values outside
+         * [0,1] (depth clamp does not catch NaN); Mali hung on them. */
+        mstring_append(ps->code,
+                       "gl_FragDepth = (isnan(nv2a_fd) || isinf(nv2a_fd)) ? 1.0 : "
+                       "clamp(nv2a_fd, 0.0, 1.0);\n");
     }
 
     MString *final = mstring_new();
     mstring_append_fmt(final, "#version %d\n\n", ps->opts.vulkan ? 450 : 400);
     mstring_append(final, mstring_get_str(preflight));
     mstring_append(final, "void main() {\n");
+    /* nv2a-port: a triangle with a NaN/inf vertex has vtxBad > 0 almost
+     * everywhere; desktop GPUs drop such triangles, Mali drew them as fans
+     * from the screen centre. */
+    if (!getenv("NV2A_NO_NAN_CULL") && !(ps->state->dbg & 4))
+        mstring_append(final, "  if (vtxBad > 0.0) discard;\n");
     mstring_append(final, mstring_get_str(clip));
     mstring_append(final, mstring_get_str(vars));
     mstring_append(final, mstring_get_str(ps->code));

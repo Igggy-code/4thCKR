@@ -1,3 +1,4 @@
+#include <string.h>
 /*
  * Geforce NV2A PGRAPH GLSL Shader Generator
  *
@@ -106,6 +107,7 @@ static void set_programmable_vsh_state(PGRAPHState *pg,
 
 void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
 {
+    { extern int nv2a_dbg_mode_now(void); vsh->dbg = nv2a_dbg_mode_now(); }
     bool vertex_program = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
                                    NV_PGRAPH_CSV0_D_MODE) == 2;
 
@@ -119,6 +121,9 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
     vsh->compressed_attrs = pg->compressed_attrs;
     vsh->uniform_attrs = pg->uniform_attrs;
     vsh->swizzle_attrs = pg->swizzle_attrs;
+    vsh->w1_attrs = pg->w1_attrs;
+    vsh->int_attrs = pg->int_attrs;
+    vsh->snorm_attrs = pg->snorm_attrs;
 
     vsh->specular_enable = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C),
                                     NV_PGRAPH_CSV0_C_SPECULAR_ENABLE);
@@ -160,6 +165,11 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
         set_programmable_vsh_state(pg, &vsh->programmable);
     }
 }
+
+bool nv2a_glsl_clip_w;
+/* nv2a-port: no clip distances (Mali): the rasteriser's own near-plane clip
+ * is made to cut at w = 0 instead -- see below */
+bool nv2a_glsl_zclip_w;
 
 MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
 {
@@ -205,9 +215,11 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         "vec4 oT3 = vec4(0.0,0.0,0.0,1.0);\n"
         "\n"
         "vec4 decompress_11_11_10(int cmp) {\n"
-        "    float x = float(bitfieldExtract(cmp, 0,  11)) / 1023.0;\n"
-        "    float y = float(bitfieldExtract(cmp, 11, 11)) / 1023.0;\n"
-        "    float z = float(bitfieldExtract(cmp, 22, 10)) / 511.0;\n"
+        /* nv2a-port: shifts instead of bitfieldExtract (sign extension of
+         * the 11/11/10-bit fields by arithmetic right shift). */
+        "    float x = float((cmp << 21) >> 21) / 1023.0;\n"
+        "    float y = float((cmp << 10) >> 21) / 1023.0;\n"
+        "    float z = float(cmp >> 22) / 511.0;\n"
         "    return vec4(x, y, z, 1);\n"
         "}\n"
         "\n"
@@ -253,6 +265,9 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                        "#define vtxPos1 v_vtxPos1\n"
                        "#define vtxPos2 v_vtxPos2\n"
                        "#define triMZ v_triMZ\n"
+                       "#define vtxZs v_vtxZs\n"
+                       "#define vtxWs v_vtxWs\n"
+                       "#define vtxBad v_vtxBad\n"
                        );
     }
     mstring_append(header, "\n");
@@ -278,6 +293,12 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
             } else if (state->swizzle_attrs & (1 << i)) {
                 mstring_append_fmt(header, "layout(location = %d) in vec4 v%d_sw;\n",
                                    i, i);
+            } else if ((state->int_attrs | state->snorm_attrs) & (1 << i)) {
+                mstring_append_fmt(header, "layout(location = %d) in ivec4 v%d_i;\n",
+                                   i, i);
+            } else if (state->w1_attrs & (1 << i)) {
+                mstring_append_fmt(header, "layout(location = %d) in vec4 v%d_w1;\n",
+                                   i, i);
             } else {
                 mstring_append_fmt(header, "layout(location = %d) in vec4 v%d;\n",
                                    i, i);
@@ -297,6 +318,17 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
 
         if (state->swizzle_attrs & (1 << i)) {
             mstring_append_fmt(body, "vec4 v%d = v%d_sw.bgra;\n", i, i);
+        }
+        if (state->int_attrs & (1 << i)) {
+            mstring_append_fmt(body, "vec4 v%d = vec4(v%d_i);\n", i, i);
+            if (state->w1_attrs & (1 << i))
+                mstring_append_fmt(body, "v%d.w = 1.0;\n", i);
+        } else if (state->snorm_attrs & (1 << i)) {
+            mstring_append_fmt(body, "vec4 v%d = max(vec4(v%d_i) / 32767.0, -1.0);\n", i, i);
+            if (state->w1_attrs & (1 << i))
+                mstring_append_fmt(body, "v%d.w = 1.0;\n", i);
+        } else if (state->w1_attrs & (1 << i)) {
+            mstring_append_fmt(body, "vec4 v%d = vec4(v%d_w1.xyz, 1.0);\n", i, i);
         }
 
     }
@@ -401,7 +433,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         // clang-format on
     }
 
-    mstring_append(body, "\n"
+    mstring_append_fmt(body, "\n"
                    "  vtxD0 = clamp(NaNToOne(oD0), 0.0, 1.0);\n"
                    "  vtxB0 = clamp(NaNToOne(oB0), 0.0, 1.0);\n"
                    "  vtxFog = oFog.x;\n"
@@ -412,9 +444,12 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                    "  vtxPos0 = vtxPos;\n"
                    "  vtxPos1 = vtxPos;\n"
                    "  vtxPos2 = vtxPos;\n"
-                   "  triMZ = 0.0;\n"
+                   "  vtxZs = vtxPos.z * vtxPos.w;\n"   /* clip-space z: perspective-interpolated, it stays right on triangles the GPU clips at the near plane */
+                   "  vtxWs = vtxPos.w;\n"
+                   "  triMZ = %s;\n"
                    "  gl_PointSize = oPts.x;\n"
-    );
+    ,
+                   getenv("NV2A_NO_FRAG_TRIMZ") ? "0.0" : "-1.0" /* nv2a-port: fragment shader computes it */);
 
     if (state->specular_enable) {
         mstring_append(body,
@@ -435,10 +470,60 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         );
     }
 
+    /* nv2a-port: keep clip-space positions finite. NV2A vertex programs
+     * easily produce inf/NaN (w = 0); desktop rasterisers drop such
+     * triangles, Mali's tiler can spin on them until the driver cancels
+     * the job (BASE_JD_EVENT_JOB_CANCELLED, VK_ERROR_DEVICE_LOST). */
+    mstring_append(body,
+                   "  vtxBad = (any(isnan(oPos)) || any(isinf(oPos))) ? 1.0 : 0.0;\n");
+    /* Saturated w (an inf the w clamp turned into 1.8e19): desktop GPUs
+     * divide it back exactly, Mali's tiler collapses such vertices into the
+     * screen centre. Divide here instead and hand Mali w = 1 (the point
+     * stays put; only perspective interpolation across it changes).
+     * NV2A_BIGW=cull drops those triangles, NV2A_BIGW=keep leaves them. */
+    {
+        const char *bw = getenv("NV2A_BIGW");
+        if (bw && !strcmp(bw, "cull"))
+            mstring_append(body, "  if (abs(oPos.w) >= 1.0e18) vtxBad = 1.0;\n");
+        else if (bw && !strcmp(bw, "norm"))
+            mstring_append(body, "  if (abs(oPos.w) >= 1.0e6 && !isinf(oPos.w)) oPos = vec4(oPos.xyz / oPos.w, 1.0);\n");
+    }
+    mstring_append(body,
+                   "  oPos = mix(oPos, vec4(0.0, 0.0, 0.0, 1.0), bvec4(any(isnan(oPos))));\n"
+                   /* Scale, never clamp per component: x, y, z and w
+                    * shrink together, so the projected point stays put.
+                    * (Pre-transformed vertices with rhw = 0 get w ~ 1.8e19;
+                    * clamping xyz alone pulled them into the screen centre.) */
+                   "  { float m = max(max(abs(oPos.x), abs(oPos.y)), max(abs(oPos.z), abs(oPos.w)));\n"
+                   "    if (m > 1.0e8) oPos *= 1.0e8 / m; }\n");
+
     if (opts.vulkan) {
         mstring_append(body,
                    "  gl_Position = oPos;\n"
         );
+        /* nv2a-port: depth clamp turns off near-plane clipping, and Mali
+         * rasterises triangles crossing w = 0 as fans from the screen
+         * centre. Clip at w = 0 only, keeping NV2A's z clamping. */
+        if (nv2a_glsl_clip_w)
+            mstring_append(body, "  gl_ClipDistance[0] = oPos.w;\n");
+        /* Without clip distances, triangles crossing w = 0 reached Mali's
+         * rasteriser whole and came out as fans from the screen centre: the
+         * black wedges over the floor where a shadow volume passed behind
+         * the camera. Here depth clamping is off and z is rewritten so the
+         * near-plane clip (z >= 0) cuts at w = 0: in front of the camera z
+         * is the depth clamped to [0, 1] (never clipped: what the clamp did),
+         * behind it z = w < 0, and the cut along an edge lands where w >= 0
+         * (the depth in front is at most 1). */
+        if (nv2a_glsl_zclip_w)
+            mstring_append(body,
+                "  oPos.z = oPos.w > 0.0 ? clamp(oPos.z / oPos.w, 0.0, 1.0) * oPos.w : oPos.w;\n"
+                "  gl_Position = oPos;\n");
+        if (state->dbg & 256)
+            mstring_append(body,
+                "  { float wc = isnan(vtxPos.w) ? 0.0 : (vtxPos.w < 0.0 ? 0.2 : (vtxPos.w < 1e-6 ? 0.4 : (vtxPos.w < 1e6 ? 0.8 : 1.0)));\n"
+                "    vtxD0 = vec4(clamp(vtxPos.x / 640.0, 0.0, 1.0), clamp(vtxPos.y / 480.0, 0.0, 1.0), wc,\n"
+                "                 isnan(vtxPos.z) ? 0.5 : clamp(vtxPos.z / clipRange.y, 0.0, 1.0));\n"
+                "    gl_Position = vec4(0.0, 0.0, 0.5, 1.0); gl_PointSize = 1024.0; }\n");
     } else {
         mstring_append(body,
                    "  gl_Position = vec4(oPos.x, oPos.y, 2.0*oPos.z - oPos.w, oPos.w);\n"
@@ -450,6 +535,13 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
     /* Return combined header + source */
     MString *output =
         mstring_from_fmt("#version %d\n\n", opts.vulkan ? 450 : 400);
+    /* nv2a-port: Conker draws the same geometry in several passes with
+     * different vertex programs and depth func EQUAL; without invariance the
+     * compiler may compute gl_Position differently per program and the later
+     * passes fail the depth test (xemu users need Mesa's
+     * vs_position_always_invariant for this title). NV2A_NO_INVARIANT=1 off. */
+    if (!getenv("NV2A_NO_INVARIANT"))
+        mstring_append(output, "invariant gl_Position;\n\n");
 
     if (opts.vulkan) {
         // FIXME: Optimize uniforms

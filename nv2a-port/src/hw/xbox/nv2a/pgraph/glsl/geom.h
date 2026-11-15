@@ -38,6 +38,7 @@ typedef struct {
 
 typedef struct GenGeomGlslOptions {
     bool vulkan;
+    bool no_point_size;   /* nv2a-port: device lacks GS point size */
 } GenGeomGlslOptions;
 
 void pgraph_glsl_set_geom_state(PGRAPHState *pg, GeomState *geom);

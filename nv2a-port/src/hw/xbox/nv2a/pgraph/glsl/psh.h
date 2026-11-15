@@ -72,7 +72,17 @@ typedef struct PshState {
 
     unsigned int surface_zeta_format;
     enum PshDepthFormat depth_format;
+    /* nv2a-port: a depth attachment is bound. Without one gl_FragDepth is
+     * not emitted: writing it into a colour-only pass makes Mali G78's
+     * fragment jobs run until the kernel hard-stops them and resets the
+     * GPU (BASE_JD_EVENT_JOB_CANCELLED / VK_ERROR_DEVICE_LOST). */
+    bool zeta_bound;
+    /* nv2a-port debug bits (NV2A_DBG_CYCLE): 1 no window clip, 2 no depth
+     * clip, 4 no NaN cull, 8 solid colour, 16 no alpha test/kills,
+     * 32 no depth/stencil test (pipeline). */
+    int dbg;
 } PshState;
+int nv2a_dbg_mode_now(void);
 
 void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
 

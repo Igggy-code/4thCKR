@@ -52,6 +52,11 @@ MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
         { flat_s,      vec4_s,  "vtxPos1" },
         { flat_s,      vec4_s,  "vtxPos2" },
         { flat_s,      float_s, "triMZ"  },
+        { smooth_s,    float_s, "vtxBad" },   /* nv2a-port: > 0 inside a triangle with a NaN/inf vertex */
+        /* nv2a-port: per-pixel NV2A depth without a geometry shader: screen z
+         * (linear in screen space) and w (perspective-correct) */
+        { smooth_s,    float_s, "vtxZs" },   /* clip-space z (see vsh.c) */
+        { smooth_s,    float_s, "vtxWs" },
     };
 
     for (int i = 0; i < ARRAY_SIZE(attr); i++) {

@@ -140,13 +140,186 @@ void pgraph_vk_finalize_glsl_compiler(void)
     glslang_finalize_process();
 }
 
+static GByteArray *compile_glsl_to_spv_uncached(PGRAPHVkState *r,
+                                                glslang_stage_t stage,
+                                                const char *glsl_source);
+
+/* nv2a-port: SPIR-V kept on disk (NV2A_CACHE_DIR/spv), keyed by the GLSL
+ * text, the stage and the SPIR-V target. A shader the title has ever used
+ * skips glslang on every later run -- glslang was most of each first-use
+ * hitch (a pipeline needs it before its first draw). NV2A_NO_SPV_CACHE=1
+ * turns it off. Bump SPV_CACHE_VERSION whenever the GLSL generator or the
+ * glslang options change in a way the GLSL text would not show. */
+#include "qemu/fast-hash.h"
+#include <sys/stat.h>
+#include <unistd.h>
+#define SPV_CACHE_VERSION 1u
+static const char *spv_cache_dir(void)
+{
+    static int init;
+    static char dir[1024];
+    if (!init) {
+        init = 1;
+        const char *base = getenv("NV2A_CACHE_DIR");
+        if (base && *base && !getenv("NV2A_NO_SPV_CACHE")) {
+            snprintf(dir, sizeof dir, "%s/spv", base);
+            mkdir(base, 0775);
+            mkdir(dir, 0775);
+            chmod(base, 0775); chmod(dir, 0775);   /* adb may collect it */
+        }
+    }
+    return dir[0] ? dir : NULL;
+}
+const char *pgraph_vk_spv_cache_dir_name(void) { return spv_cache_dir(); }
+static unsigned s_spv_hits, s_spv_misses;
+void pgraph_vk_spv_cache_stats(unsigned *hits, unsigned *misses)
+{
+    *hits = s_spv_hits; *misses = s_spv_misses;
+    s_spv_hits = s_spv_misses = 0;
+}
+
+/* nv2a-port: the SPIR-V cache read into memory by a background thread at
+ * start-up. Opening each file on the app's storage cost ~1 ms during play
+ * (2-3 modules a shader set, dozens of sets when a new effect first
+ * appears). NV2A_SPV_NO_PRELOAD=1: read files on demand only. */
+#include <dirent.h>
+#include <pthread.h>
+typedef struct { uint64_t key; uint8_t *data; uint32_t len; } SpvMem;
+static SpvMem *s_spvm; static size_t s_spvm_cap;   /* power of two */
+static pthread_mutex_t s_spvm_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_spvm_started;
+static void spvm_put(uint64_t key, uint8_t *data, uint32_t len)
+{
+    pthread_mutex_lock(&s_spvm_lock);
+    if (!s_spvm) { s_spvm_cap = 1 << 14; s_spvm = calloc(s_spvm_cap, sizeof *s_spvm); }
+    size_t i = (size_t)(key * 0x9E3779B97F4A7C15ull) & (s_spvm_cap - 1);
+    for (size_t n = 0; n < s_spvm_cap; n++, i = (i + 1) & (s_spvm_cap - 1)) {
+        if (!s_spvm[i].data) { s_spvm[i].key = key; s_spvm[i].data = data; s_spvm[i].len = len; data = NULL; break; }
+        if (s_spvm[i].key == key) break;
+    }
+    pthread_mutex_unlock(&s_spvm_lock);
+    free(data);   /* full or already there */
+}
+static GByteArray *spvm_get(uint64_t key)
+{
+    GByteArray *out = NULL;
+    pthread_mutex_lock(&s_spvm_lock);
+    if (s_spvm) {
+        size_t i = (size_t)(key * 0x9E3779B97F4A7C15ull) & (s_spvm_cap - 1);
+        for (size_t n = 0; n < s_spvm_cap && s_spvm[i].data; n++, i = (i + 1) & (s_spvm_cap - 1))
+            if (s_spvm[i].key == key) {
+                uint8_t *cp = g_malloc(s_spvm[i].len);
+                memcpy(cp, s_spvm[i].data, s_spvm[i].len);
+                out = g_byte_array_new_take(cp, s_spvm[i].len);
+                break;
+            }
+    }
+    pthread_mutex_unlock(&s_spvm_lock);
+    return out;
+}
+static void *spvm_preload(void *arg)
+{
+    const char *dir = arg;
+    DIR *d = opendir(dir);
+    if (!d) return NULL;
+    struct dirent *de; unsigned n = 0; size_t bytes = 0;
+    while ((de = readdir(d)) && n < 12000 && bytes < (96u << 20)) {
+        size_t l = strlen(de->d_name);
+        if (l != 20 || strcmp(de->d_name + 16, ".spv")) continue;
+        uint64_t key = strtoull(de->d_name, NULL, 16);
+        char path[1200]; snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (sz >= 20 && (sz % 4) == 0 && sz < (1 << 20)) {
+            uint8_t *buf = malloc((size_t)sz);
+            if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz && *(uint32_t *)buf == 0x07230203u) {
+                spvm_put(key, buf, (uint32_t)sz); n++; bytes += (size_t)sz;
+            } else free(buf);
+        }
+        fclose(f);
+    }
+    closedir(d);
+    fprintf(stderr, "[vk] SPIR-V cache in memory: %u modules, %zu KB\n", n, bytes / 1024);
+    return NULL;
+}
+void pgraph_vk_spv_preload(void)
+{
+    const char *dir = spv_cache_dir();
+    if (!dir || s_spvm_started || getenv("NV2A_SPV_NO_PRELOAD")) return;
+    s_spvm_started = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, spvm_preload, (void *)dir) == 0) pthread_detach(t);
+}
+
 GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
                                           glslang_stage_t stage,
                                           const char *glsl_source)
 {
+    const char *dir = spv_cache_dir();
+    if (!dir) return compile_glsl_to_spv_uncached(r, stage, glsl_source);
+    pgraph_vk_spv_preload();
+
+    size_t len = strlen(glsl_source);
+    uint64_t key = fast_hash((const uint8_t *)glsl_source, len);
+    key ^= ((uint64_t)stage << 56) ^ ((uint64_t)r->vk_api_version << 8)
+         ^ ((uint64_t)(r->device_props.vendorID == 0x13B5) << 4) ^ SPV_CACHE_VERSION;
+    key ^= (uint64_t)len * 0x9E3779B97F4A7C15ull;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)key);
+
+    {   GByteArray *m = spvm_get(key);
+        if (m) { s_spv_hits++; return m; } }
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n >= 20 && (n % 4) == 0 && n < 16 * 1024 * 1024) {
+            uint8_t *buf = g_malloc((size_t)n);
+            size_t got = fread(buf, 1, (size_t)n, f);
+            uint32_t magic;
+            memcpy(&magic, buf, 4);
+            if (got == (size_t)n && magic == 0x07230203u) {
+                fclose(f);
+                s_spv_hits++;
+                return g_byte_array_new_take(buf, (size_t)n);
+            }
+            g_free(buf);
+        }
+        fclose(f);
+    }
+
+    GByteArray *spv = compile_glsl_to_spv_uncached(r, stage, glsl_source);
+    s_spv_misses++;
+    if (spv && spv->len) {
+        char tmp[1300];
+        snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
+        FILE *o = fopen(tmp, "wb");
+        if (o) {
+            size_t w = fwrite(spv->data, 1, spv->len, o);
+            if (fclose(o) == 0 && w == spv->len) rename(tmp, path);
+            else unlink(tmp);
+        }
+    }
+    return spv;
+}
+
+static GByteArray *compile_glsl_to_spv_uncached(PGRAPHVkState *r,
+                                                glslang_stage_t stage,
+                                                const char *glsl_source)
+{
     glslang_target_client_version_t client_version;
     glslang_target_language_version_t target_spv;
 
+    /* nv2a-port: from SPIR-V 1.6 glslang turns `discard` into
+     * OpDemoteToHelperInvocation, a capability xemu never enables on the
+     * device (validation: VUID-VkShaderModuleCreateInfo-pCode-08740). Mali
+     * gets SPIR-V 1.5, where discard stays OpKill. */
+    if (r->device_props.vendorID == 0x13B5 && r->vk_api_version >= VK_API_VERSION_1_2) {
+        client_version = GLSLANG_TARGET_VULKAN_1_2;
+        target_spv = GLSLANG_TARGET_SPV_1_5;
+    } else
 #ifdef VK_API_VERSION_1_4
     if (r->vk_api_version >= VK_API_VERSION_1_4) {
         client_version = GLSLANG_TARGET_VULKAN_1_4;
@@ -287,6 +460,8 @@ static void block_to_uniforms(const SpvReflectBlockVariable *block, ShaderUnifor
     layout->uniforms = g_malloc0_n(block->member_count, sizeof(ShaderUniform));
     layout->total_size = block->size;
     layout->allocation = g_malloc0(block->size);
+    layout->dirty = true;   /* nv2a-port */
+    layout->c_gen = 0;
 
     for (uint32_t k = 0; k < block->member_count; ++k) {
         const SpvReflectBlockVariable *member = &block->members[k];

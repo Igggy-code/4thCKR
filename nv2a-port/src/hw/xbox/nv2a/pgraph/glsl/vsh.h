@@ -48,12 +48,17 @@ typedef struct ProgrammableVshState {
     int program_length;
 } ProgrammableVshState;
 
+extern bool nv2a_glsl_clip_w;   /* nv2a-port: write gl_ClipDistance[0] = w */
+
 typedef struct {
     unsigned int surface_scale_factor;  // FIXME: Remove
 
     uint16_t compressed_attrs;
     uint16_t uniform_attrs;
     uint16_t swizzle_attrs;
+    uint16_t w1_attrs;
+    uint16_t int_attrs;
+    uint16_t snorm_attrs;
 
     bool fog_enable;
     enum VshFogMode fog_mode;
@@ -70,6 +75,7 @@ typedef struct {
     bool z_perspective;
 
     bool is_fixed_function;
+    int dbg;   /* nv2a-port: see PshState.dbg (256 = position probe) */
     FixedFunctionVshState fixed_function;
     ProgrammableVshState programmable;
 } VshState;
