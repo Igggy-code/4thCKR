@@ -208,10 +208,77 @@ uint8_t *s3tc_decompress_3d(enum S3TC_DECOMPRESS_FORMAT color_format,
     return converted_data;
 }
 
+/* nv2a-port: a fast path for 2D textures of whole 4x4 blocks (nearly all
+ * of them). Colours are packed RGBA words written a row at a time; same
+ * results as the per-pixel code above (same rounding). Mali has no BC
+ * formats, so every DXT texture is decoded here on the CPU, and the old path
+ * cost ~3-4 ms per texture -- the bulk of the hitches when a scene first
+ * shows its textures. */
+static inline uint32_t s3tc_pack(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+static void s3tc_fast_2d(enum S3TC_DECOMPRESS_FORMAT fmt, const uint8_t *data,
+                         uint32_t *out, unsigned width, unsigned height)
+{
+    unsigned bx = width / 4, by = height / 4, bsz = fmt == S3TC_DECOMPRESS_FORMAT_DXT1 ? 8 : 16;
+    for (unsigned j = 0; j < by; j++) {
+        for (unsigned i = 0; i < bx; i++) {
+            const uint8_t *blk = data + (size_t)(j * bx + i) * bsz;
+            const uint8_t *cb = fmt == S3TC_DECOMPRESS_FORMAT_DXT1 ? blk : blk + 8;
+            uint16_t c0, c1; uint32_t idx;
+            memcpy(&c0, cb, 2); memcpy(&c1, cb + 2, 2); memcpy(&idx, cb + 4, 4);
+            uint8_t r[4], g[4], b[4], a1[16];
+            decode_bc1_colors(c0, c1, r, g, b, a1,
+                              fmt == S3TC_DECOMPRESS_FORMAT_DXT1 && c0 <= c1);
+            uint8_t al[16];
+            if (fmt == S3TC_DECOMPRESS_FORMAT_DXT3) {
+                uint64_t alpha; memcpy(&alpha, blk, 8);
+                for (int k = 0; k < 16; k++)
+                    al[k] = (((alpha >> 4 * k) & 0x0F) << 4) * 0xFF / 0xF0;
+            } else if (fmt == S3TC_DECOMPRESS_FORMAT_DXT5) {
+                uint64_t alpha; memcpy(&alpha, blk, 8);
+                uint8_t a0 = blk[0], a1v = blk[1], ap[8];
+                ap[0] = a0; ap[1] = a1v;
+                if (a0 > a1v) {
+                    for (int k = 1; k < 7; k++) ap[k + 1] = ((7 - k) * a0 + k * a1v) / 7;
+                } else {
+                    for (int k = 1; k < 5; k++) ap[k + 1] = ((5 - k) * a0 + k * a1v) / 5;
+                    ap[6] = 0; ap[7] = 255;
+                }
+                for (int k = 0; k < 16; k++) al[k] = ap[(alpha >> (16 + 3 * k)) & 7];
+            }
+            uint32_t pal[4];
+            for (int k = 0; k < 4; k++) pal[k] = s3tc_pack(r[k], g[k], b[k], 255);
+            if (fmt == S3TC_DECOMPRESS_FORMAT_DXT1) {
+                pal[0] = s3tc_pack(r[0], g[0], b[0], a1[0]);
+                pal[1] = s3tc_pack(r[1], g[1], b[1], a1[1]);
+                pal[2] = s3tc_pack(r[2], g[2], b[2], a1[2]);
+                pal[3] = s3tc_pack(r[3], g[3], b[3], a1[3]);
+            }
+            uint32_t *row = out + (size_t)(j * 4) * width + i * 4;
+            for (int y = 0; y < 4; y++, row += width) {
+                for (int x = 0; x < 4; x++) {
+                    int k = y * 4 + x;
+                    uint32_t c = pal[(idx >> (2 * k)) & 3];
+                    if (fmt != S3TC_DECOMPRESS_FORMAT_DXT1)
+                        c = (c & 0x00FFFFFFu) | ((uint32_t)al[k] << 24);
+                    row[x] = c;
+                }
+            }
+        }
+    }
+}
+
 uint8_t *s3tc_decompress_2d(enum S3TC_DECOMPRESS_FORMAT color_format,
                             const uint8_t *data, unsigned int width,
                             unsigned int height)
 {
+    if ((width & 3) == 0 && (height & 3) == 0 && !getenv("NV2A_S3TC_SLOW")) {
+        uint8_t *out = (uint8_t *)g_malloc((size_t)width * height * 4);
+        s3tc_fast_2d(color_format, data, (uint32_t *)out, width, height);
+        return out;
+    }
     assert(width > 0);
     assert(height > 0);
     unsigned int physical_width = (width + 3) & ~3,

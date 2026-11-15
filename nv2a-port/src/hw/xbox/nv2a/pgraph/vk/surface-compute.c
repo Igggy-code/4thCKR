@@ -66,7 +66,7 @@ const char *unpack_z24s8_to_d24_unorm_s8_uint_glsl =
     "    if (idx_out % 4 == 0) {\n"
     "       uint stencil_value = 0;\n"
     "       for (int i = 0; i < 4; i++) {\n" // Include next 3 pixels
-    "           uint v = depth_stencil_in[get_input_idx(idx_out + i)] & 0xff;\n"
+    "           uint v = depth_stencil_in[min(get_input_idx(idx_out + i), uint(depth_stencil_in.length()) - 1u)] & 0xff;\n"
     "           stencil_value |= v << (i * 8);\n"
     "       }\n"
     "       stencil_out[idx_out / 4] = stencil_value;\n"
@@ -111,7 +111,7 @@ const char *unpack_z24s8_to_d32_sfloat_s8_uint_glsl =
     "    if (idx_out % 4 == 0) {\n"
     "       uint stencil_value = 0;\n"
     "       for (int i = 0; i < 4; i++) {\n" // Include next 3 pixels
-    "           uint v = depth_stencil_in[get_input_idx(idx_out + i)] & 0xff;\n"
+    "           uint v = depth_stencil_in[min(get_input_idx(idx_out + i), uint(depth_stencil_in.length()) - 1u)] & 0xff;\n"
     "           stencil_value |= v << (i * 8);\n"
     "       }\n"
     "       stencil_out[idx_out / 4] = stencil_value;\n"
@@ -341,7 +341,11 @@ static int get_workgroup_size_for_output_units(PGRAPHVkState *r, int output_unit
     //        evenly divides output_units.
 
     while (group_size > 1) {
-        if (group_size > r->device_props.limits.maxComputeWorkGroupSize[0]) {
+        /* nv2a-port: halve past the device limit too -- a bare continue spun
+         * for ever on GPUs whose limit is below 1024 (Mali: 512). */
+        if (group_size > (int)r->device_props.limits.maxComputeWorkGroupSize[0] ||
+            group_size > (int)r->device_props.limits.maxComputeWorkGroupInvocations) {
+            group_size /= 2;
             continue;
         }
         if (output_units % group_size == 0) {
@@ -381,6 +385,7 @@ void pgraph_vk_pack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
                                   VkCommandBuffer cmd, VkBuffer src,
                                   VkBuffer dst, bool downscale)
 {
+    SURF_SCALE_SCOPE(pg, surface);
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     unsigned int input_width = surface->width, input_height = surface->height;
@@ -450,6 +455,7 @@ void pgraph_vk_pack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
 
     // FIXME: Check max group count
 
+    { extern int nv2a_vk_cb_compute; nv2a_vk_cb_compute++; }
     vkCmdDispatch(cmd, group_count, 1, 1);
     pgraph_vk_end_debug_marker(r, cmd);
 }
@@ -458,6 +464,7 @@ void pgraph_vk_unpack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
                                     VkCommandBuffer cmd, VkBuffer src,
                                     VkBuffer dst)
 {
+    SURF_SCALE_SCOPE(pg, surface);
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     unsigned int input_width = surface->width, input_height = surface->height;
@@ -521,6 +528,7 @@ void pgraph_vk_unpack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
     vkCmdPushConstants(cmd, r->compute.pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants),
                        push_constants);
+    { extern int nv2a_vk_cb_compute; nv2a_vk_cb_compute++; }
     vkCmdDispatch(cmd, group_count, 1, 1);
     pgraph_vk_end_debug_marker(r, cmd);
 }
