@@ -36,7 +36,7 @@
 #define SDLA_BUF_SAMPLES_MIN     128
 #define SDLA_BUF_SAMPLES_MAX     4096
 #define SDLA_NUM_BUFS_MIN        2
-#define SDLA_NUM_BUFS_MAX        8
+#define SDLA_NUM_BUFS_MAX        32
 
 static SDL_AudioDeviceID g_dev;
 static int       g_buf_samples = SDLA_BUF_SAMPLES_DEFAULT;
@@ -90,6 +90,18 @@ int xa2_init(void)
     if (e && *e && *e != '0')
         SDL_setenv("SDL_AUDIODRIVER", "dummy", 0);
 
+#ifdef __ANDROID__
+    /* nv2a-port: AAudio first. SDL 2's default on Android is OpenSL ES,
+     * whose buffers are refilled by an ordinary SDL thread: a late refill
+     * under load (the emulator keeps several cores busy) played a
+     * crackle/hiss. AAudio's data path runs on the audio HAL's own
+     * high-priority thread. OpenSL ES stays as the fallback; the
+     * SDL_AUDIODRIVER environment variable still overrides both. */
+    if (!getenv("SDL_AUDIODRIVER") && !SDL_WasInit(SDL_INIT_AUDIO))
+        SDL_SetHint(SDL_HINT_AUDIODRIVER,
+                    getenv("RECOMP_AUDIO_OPENSL") ? "openslES" : "aaudio,openslES");
+#endif
+
     if (!SDL_WasInit(SDL_INIT_AUDIO)) {
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
             fprintf(stderr, "[SDL2] audio init failed: %s\n", SDL_GetError());
@@ -108,6 +120,18 @@ int xa2_init(void)
     /* No format changes allowed: the mixer's 48 kHz s16 stereo is what the
      * queue takes, and SDL converts for the device if it has to. */
     g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+#ifdef __ANDROID__
+    if (g_dev == 0 && g_audio_opened && !getenv("SDL_AUDIODRIVER")) {
+        const char *drv = SDL_GetCurrentAudioDriver();
+        if (drv && !strcmp(drv, "aaudio")) {
+            fprintf(stderr, "[SDL2] AAudio device failed (%s), trying OpenSL ES\n", SDL_GetError());
+            SDL_QuitSubSystem(SDL_INIT_AUDIO);
+            SDL_SetHint(SDL_HINT_AUDIODRIVER, "openslES");
+            if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0)
+                g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        }
+    }
+#endif
     if (g_dev == 0) {
         fprintf(stderr, "[SDL2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         if (g_audio_opened) { SDL_QuitSubSystem(SDL_INIT_AUDIO); g_audio_opened = 0; }
@@ -122,6 +146,16 @@ int xa2_init(void)
          * fed, against marks sized for the limit, and may underrun. */
         if (g_buf_samples > SDLA_BUF_SAMPLES_MAX)
             g_buf_samples = SDLA_BUF_SAMPLES_MAX;
+    }
+
+    /* nv2a-port: the queue's lead is counted in device buffers. AAudio's
+     * are small (a few ms), and DirectSound stops the sequencer for up to
+     * ~10 ms dozens of times a second, so keep at least ~85 ms (4096
+     * samples) of lead whatever the buffer size, as with OpenSL ES' four
+     * 1024-sample buffers. */
+    if (g_buf_samples > 0 && g_num_bufs * g_buf_samples < 4096) {
+        int need = (4096 + g_buf_samples - 1) / g_buf_samples;
+        g_num_bufs = need > SDLA_NUM_BUFS_MAX ? SDLA_NUM_BUFS_MAX : need;
     }
 
     g_frames_written = 0;
@@ -164,9 +198,47 @@ int xa2_is_active(void)
 /* Hand one EP period to the queue. SDL copies the samples, so the caller's
  * buffer is free on return. Nothing is ever refused by depth: the queue is
  * unbounded and pacing by queue depth holds it at the marks. */
+/* REC: the last 12 s of what went to the speaker, written as a WAV next to
+ * the capture (noise, crackle or silence can then be looked at). */
+#define ARING (48000 * 12)
+static int16_t s_aring[ARING * 2];
+static unsigned s_aring_pos;
+volatile int g_apu_wav_request;
+static void aring_dump(void)
+{
+    const char *dir = getenv("NV2A_DUMP_DIR");
+    if (!dir) return;
+    static int n;
+    char path[600];
+    snprintf(path, sizeof path, "%s/audio_%02d.wav", dir, ++n);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    uint32_t data = ARING * 4, riff = 36 + data, sr = 48000, br = 48000 * 4, fmt = 16;
+    uint16_t pcm = 1, ch = 2, ba = 4, bits = 16;
+    fwrite("RIFF", 1, 4, f); fwrite(&riff, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f);
+    fwrite(&fmt, 4, 1, f); fwrite(&pcm, 2, 1, f); fwrite(&ch, 2, 1, f); fwrite(&sr, 4, 1, f);
+    fwrite(&br, 4, 1, f); fwrite(&ba, 2, 1, f); fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f);
+    unsigned p0 = s_aring_pos % ARING;
+    fwrite(s_aring + p0 * 2, 4, ARING - p0, f);
+    fwrite(s_aring, 4, p0, f);
+    fclose(f);
+    fprintf(stderr, "[APU] last 12 s of output -> %s\n", path);
+}
+
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
+    for (int i = 0; i < num_samples; i++) {
+        unsigned q = (s_aring_pos++) % ARING;
+        s_aring[q * 2] = samples[i * 2]; s_aring[q * 2 + 1] = samples[i * 2 + 1];
+    }
+    if (g_apu_wav_request == 1) { g_apu_wav_request = 2; aring_dump(); }
     if (!g_initialized || !g_dev || num_samples <= 0) return 0;
+    {   extern float g_apu_out_peak;
+        for (int i = 0; i < num_samples * SDLA_CHANNELS; i += 8) {
+            float a = samples[i] < 0 ? -samples[i] / 32768.0f : samples[i] / 32768.0f;
+            if (a > g_apu_out_peak) g_apu_out_peak = a;
+        } }
     if (SDL_QueueAudio(g_dev, samples,
                        (Uint32)num_samples * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
         fprintf(stderr, "[SDL2] SDL_QueueAudio failed: %s\n", SDL_GetError());

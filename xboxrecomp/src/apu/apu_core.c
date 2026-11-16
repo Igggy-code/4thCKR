@@ -1,3 +1,8 @@
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+#endif
 /*
  * MCPX APU Core - Standalone extraction from xemu
  *
@@ -89,9 +94,23 @@ static inline uint32_t apu_mapped_ram(void)
     return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
 }
 
+extern ptrdiff_t g_xbox_mem_offset;
+extern int guest_vmem_active(void);
+/* The extended guest VMA (guest_vmem.c): heap the title allocated above
+ * the 64 MB image, which MmGetPhysicalAddress hands back unchanged. */
+static inline int apu_in_ext_vma(uint32_t raw)
+{
+    return raw >= 0x74000000u && raw < 0x7FFE0000u && guest_vmem_active();
+}
+
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    /* nv2a-port: a DirectSound stream buffer in the extended VMA (Conker's
+     * dialogue: 0x742D4A10). Folded into 64 MB, the voice played whatever
+     * lay there -- loud white noise where Berri's voice should be. */
+    if (apu_in_ext_vma((uint32_t)addr))
+        return (uint8_t *)((uintptr_t)(uint32_t)addr + g_xbox_mem_offset);
     /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
      * the heap sits above 0x04000000, and so do the sound buffers a title
      * malloc()s and hands to DirectSound as plain pointers, which
@@ -131,6 +150,31 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
+/* Whether the backing that holds start also holds the next bytes bytes, so a
+ * stream segment can be read straight from mcpx_apu_phys(start). */
+int mcpx_apu_span_ok(uint64_t start, size_t bytes)
+{
+    if (bytes == 0) return 0;
+    uint32_t raw = (uint32_t)start;
+    if (apu_in_ext_vma(raw))
+        return (uint64_t)raw + bytes <= 0x7FFE0000u;
+    const uint8_t *p = mcpx_apu_phys(start);
+    const uint8_t *ram = g_apu_ram_ptr, *win = g_apu_ram_ptr + 0x80000000u;
+    if (p >= ram && p < ram + apu_mapped_ram())
+        return p + bytes <= ram + apu_mapped_ram();
+    if (p >= win && p < win + (64u << 20))
+        return p + bytes <= win + (64u << 20);
+    return 0;
+}
+
+/* An address no RAM backs: above 64 MB and above what the host mapped. */
+int mcpx_apu_addr_wraps(uint32_t a)
+{
+    if (apu_in_ext_vma(a)) return 0;
+    a &= 0x0FFFFFFFu;
+    return a >= (64u << 20) && a >= apu_mapped_ram();
+}
+
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
  * per-voice line and the doorbell line: "named" (a heap page
  * MmGetPhysicalAddress named), "win" (a page the contiguous allocator handed
@@ -147,7 +191,10 @@ const char *mcpx_apu_phys_class(uint64_t addr)
     if (xbox_PhysRamNamedAt(a))
         return "named";
     if (xbox_ContiguousPageMap()[a >> 12])
-        return "win";
+        /* "win-pg": the page was named RAM but the heap table says this byte
+         * is not in a named block -- the case that played Conker's music as
+         * noise when the block lookup lost its way. */
+        return xbox_PhysRamNameMap()[a >> 12] ? "win-pg" : "win";
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return "img";
     if (a < xbox_ContiguousAllocatedBytes())
@@ -237,8 +284,8 @@ extern void xbox_IrqNoteUngated(int line);
 #else
 #  define APU_TLS __thread
 #endif
-extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
-extern APU_TLS uint32_t g_fs_base;
+#include "../kernel/recomp_cpu_tls.h" /* was: extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi; */
+#include "../kernel/recomp_cpu_tls.h" /* was: extern APU_TLS uint32_t g_fs_base; */
 
 /* Call the connected service routine while the line is up, from the frame
  * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
@@ -266,7 +313,10 @@ static int apu_call_isr(void)
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    extern void nv2a_tl(int, uint32_t);
+    nv2a_tl(26, 0);
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    nv2a_tl(27, g_eax);
     {
         static unsigned n;
         if (n++ < 3) {
@@ -326,6 +376,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
      * runs other lines' routines here. */
     if (xbox_IrqSafePointsOn()) {
         how = xbox_IrqPost(XBOX_IRQ_APU);
+        { extern void nv2a_tl(int, uint32_t); nv2a_tl(25, (uint32_t)how); }
         if (how == XBOX_IRQ_POSTED) {
             qemu_mutex_lock(&d->lock);
             return;
@@ -392,6 +443,12 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
         fprintf(stderr, "[APU] read  [0x%05llX] size=%u -> 0x%08llX\n",
                 (unsigned long long)addr, size, (unsigned long long)r);
     (void)size;
+    {   /* timeline: register reads while the sequencer is stopped */
+        extern void nv2a_tl(int, uint32_t);
+        if (GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]), NV_PAPU_SECTL_XCNTMODE)
+            == NV_PAPU_SECTL_XCNTMODE_OFF)
+            nv2a_tl(33, ((uint32_t)addr << 12) | ((uint32_t)r & 0xFFF));
+    }
     return r;
 }
 
@@ -399,6 +456,12 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                      unsigned int size)
 {
     MCPXAPUState *d = (MCPXAPUState *)opaque;
+    {
+        extern void nv2a_tl(int, uint32_t);
+        if (GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]), NV_PAPU_SECTL_XCNTMODE)
+            == NV_PAPU_SECTL_XCNTMODE_OFF)
+            nv2a_tl(34, ((uint32_t)addr << 12) | ((uint32_t)val & 0xFFF));
+    }
 
     if (apu_mmio_trace())
         fprintf(stderr, "[APU] write [0x%05llX] size=%u <- 0x%08llX\n",
@@ -419,6 +482,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
+        { extern void nv2a_tl(int, uint32_t); nv2a_tl(24, (uint32_t)val); }
         qatomic_set(&d->regs[addr], (uint32_t)val);
         /* Starting the APU has to start the frame thread.
          *
@@ -528,6 +592,11 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
         int low, high;
         xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
                          MIXER_FRAME_SAMPLES, &low, &high);
+        /* RECOMP_AUDIO_LOW=<samples> overrides the low mark (tests) */
+        {
+            const char *lo = getenv("RECOMP_AUDIO_LOW");
+            if (lo && atoi(lo) > 0) low = atoi(lo);
+        }
         d->monitor.queued_bytes_low  = low * SAMPLE_BYTES;
         d->monitor.queued_bytes_high = high * SAMPLE_BYTES;
         fprintf(stderr, "[APU] Using %s audio backend (pacing: %d..%d samples queued)\n",
@@ -1047,8 +1116,13 @@ static void throttle(MCPXAPUState *d)
             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
         if (wait_us <= 0)
             break;
-        qemu_cond_timedwait(&d->cond, &d->lock,
-                            (int)((wait_us + 999) / 1000));
+        /* nv2a-port: in 1 ms slices, acking the DSP doorbell between them.
+         * DirectSound's SSL routine stops the sequencer, rings the doorbell
+         * and spins on the ack before starting it again; the ack came only
+         * after this wait, up to two periods with the queue full -- every
+         * stop lasted ~10 ms instead of a fraction of one. */
+        qemu_cond_timedwait(&d->cond, &d->lock, wait_us > 1000 ? 1 : (int)((wait_us + 999) / 1000));
+        mcpx_apu_dsp_ack_poll(d);
     }
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
@@ -1103,7 +1177,41 @@ static void se_frame(MCPXAPUState *d)
  * -- for up to APU_SEQ_HOLD_US. One that stays off longer (the title stopped
  * it) gets lightweight frames as before, so the software mixer and the test
  * tone keep running, and is not held again until the VP has rendered. */
-#define APU_SEQ_HOLD_US 5000
+/* nv2a-port (Conker, Android): the restart comes from the APU interrupt's
+ * DPC, which here can take longer than 5 ms to run (the guest's DPC
+ * machinery, the one-CPU gate, a busy title thread). Every such stop then
+ * went LIGHT for a whole period or two: 5.3/10.7 ms of digital zero ~25
+ * times a second, the stutter heard in films and in play. Held frames cost
+ * nothing audible while the device queue has lead (42-85 ms), so the hold
+ * is 40 ms by default; RECOMP_APU_SEQ_HOLD_US sets it. */
+#define APU_SEQ_HOLD_US_DEFAULT 40000
+static int64_t apu_seq_hold_us(void)
+{
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_APU_SEQ_HOLD_US");
+        v = e && *e ? atoll(e) : APU_SEQ_HOLD_US_DEFAULT;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+
+/* Sequencer stop spells (SSL service routine), for the AUDIO-HOST report */
+static struct { unsigned n, over5, light; int64_t max_us, sum_us; } s_seqst;
+
+static void seq_stats_line(void)
+{
+    static int64_t next;
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (!hs_on()) return;
+    if (now < next) return;
+    if (next && s_seqst.n)
+        fprintf(stderr, "[APU-SEQ] %u stops in 5 s, avg %.2f ms, max %.2f ms, %u over 5 ms, %u went light\n",
+                s_seqst.n, s_seqst.sum_us / 1000.0 / s_seqst.n, s_seqst.max_us / 1000.0,
+                s_seqst.over5, s_seqst.light);
+    memset(&s_seqst, 0, sizeof s_seqst);
+    next = now + 5000000;
+}
 
 int mcpx_apu_frame_kind(MCPXAPUState *d, int64_t now_us)
 {
@@ -1111,6 +1219,7 @@ int mcpx_apu_frame_kind(MCPXAPUState *d, int64_t now_us)
                             NV_PAPU_SECTL_XCNTMODE);
     uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
 
+    seq_stats_line();
     if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF) {
         if (!d->seq_ran || g_test_tone.active)
             return APU_FRAME_LIGHT;
@@ -1118,10 +1227,17 @@ int mcpx_apu_frame_kind(MCPXAPUState *d, int64_t now_us)
             d->seq_off = true;
             d->seq_off_us = now_us;
         }
-        if (now_us - d->seq_off_us < APU_SEQ_HOLD_US)
+        if (now_us - d->seq_off_us < apu_seq_hold_us())
             return APU_FRAME_HELD;
         d->seq_ran = false;
+        s_seqst.light++;
         return APU_FRAME_LIGHT;
+    }
+    if (d->seq_off) {
+        int64_t len = now_us - d->seq_off_us;
+        s_seqst.n++; s_seqst.sum_us += len;
+        if (len > s_seqst.max_us) s_seqst.max_us = len;
+        if (len > 5000) s_seqst.over5++;
     }
     d->seq_off = false;
     if (g_test_tone.active)
@@ -1168,6 +1284,13 @@ static void apu_irq_stats_line(void)
 
 static void *mcpx_apu_frame_thread(void *arg)
 {
+#ifdef __ANDROID__
+    /* nv2a-port: audio priority (Android's THREAD_PRIORITY_URGENT_AUDIO,
+     * nice -19, allowed to apps). At nice 0 the mixer lost the CPU to the
+     * emulator's busy threads during loads and the output ran dry. */
+    setpriority(PRIO_PROCESS, (id_t)gettid(), -19);
+    prctl(PR_SET_NAME, "apu.frame", 0, 0, 0);
+#endif
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
     qemu_mutex_lock(&d->lock);
 

@@ -47,6 +47,13 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+static int apu_ssl_log(void)
+{
+    static int on = -1, n;
+    if (on < 0) on = apu_env_on("RECOMP_APU_SSLLOG");
+    return on && n++ < 40000;
+}
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
@@ -323,6 +330,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
+        { extern unsigned g_apu_sum_pause[2]; g_apu_sum_pause[(argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0]++; }
         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
@@ -466,6 +474,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        if (apu_ssl_log()) fprintf(stderr, "[SSL] v%d A base %u count %u\n", current_voice,
+            (unsigned)d->vp.ssl[current_voice].base[ssl], (unsigned)d->vp.ssl[current_voice].count[ssl]);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -476,6 +486,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        if (apu_ssl_log()) fprintf(stderr, "[SSL] v%d B base %u count %u\n", current_voice,
+            (unsigned)d->vp.ssl[current_voice].base[ssl], (unsigned)d->vp.ssl[current_voice].count[ssl]);
         break;
     }
 
@@ -483,6 +495,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         assert((argument & 0x3f) == 0);
         assert(argument < (MCPX_HW_MAX_SSL_PRDS * NV_PSGE_SIZE));
         d->vp.ssl_base_page = argument;
+        if (apu_ssl_log()) fprintf(stderr, "[SSL] current %u (voice %u)\n", (unsigned)argument,
+                                   (unsigned)d->regs[NV_PAPU_FECV]);
         break;
     }
 
@@ -540,6 +554,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                           + (d->vp.ssl_base_page * 8)
                           + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
             stl_le_phys(address_space_memory, addr, argument);
+            if (apu_ssl_log()) fprintf(stderr, "[SSL] write %s entry %u = %08X\n",
+                (method & 4) ? "len" : "off",
+                (unsigned)(d->vp.ssl_base_page + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET) / 8),
+                (unsigned)argument);
         } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
             assert((method & 3) == 0);
@@ -1079,6 +1097,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                        int num_samples_requested)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    hwaddr pc_page = (hwaddr)-1; uint8_t *pc_host = NULL;   /* nv2a-port */
     bool stereo = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
     unsigned int channels = stereo ? 2 : 1;
@@ -1111,9 +1130,16 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     int ssl_index = 0, ssl_seg = 0, page = 0, count = 0;
     int seg_len = 0, seg_cs = 0, seg_spb = 0, seg_s = 0;
     hwaddr segment_offset = 0;
+    /* nv2a-port: a stream segment is one physically contiguous run to the
+     * title (DirectSound names its start page); resolved page by page, its
+     * later pages could land on a different backing than its first (window
+     * instead of heap RAM) and play whatever lay there -- hiss where a
+     * cutscene's dialogue should be. The whole segment follows its start. */
+    const uint8_t *seg_host = NULL;
     uint32_t segment_length = 0;
     size_t block_size;
 
+    bool silent_seg = false;
     int adpcm_block_index = -1;
     /* Room for the largest block the MCPX accepts (see the check below). */
     uint32_t adpcm_block[36 * ADPCM_MAX_BLOCKS / 4];
@@ -1157,7 +1183,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(address_space_memory, addr);
+        seg_host = mcpx_apu_phys(segment_offset);
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
+        { extern uint32_t g_vseg[MCPX_HW_MAX_VOICES], g_vseg_len[MCPX_HW_MAX_VOICES];
+          g_vseg[v] = (uint32_t)segment_offset; g_vseg_len[v] = (uint32_t)segment_length; }
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;
@@ -1170,6 +1199,51 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
         assert(seg_len > 0);
         ebo = seg_len - 1;
+        /* nv2a-port: a segment past the end of RAM. The console has nothing
+         * there; here the address folds into low RAM and the VP played
+         * whatever lay there -- full-scale white noise (zcr 0.53) on
+         * DirectSound's stream voices in Conker's gameplay, heard as hiss
+         * through the effect sends. Such a segment is played as silence,
+         * its position and notifications kept as before.
+         * RECOMP_APU_WRAP_PLAY=1 plays it as before. */
+        {
+            static int play_wrap = -1;
+            if (play_wrap < 0) play_wrap = apu_env_on("RECOMP_APU_WRAP_PLAY");
+            uint32_t a = (uint32_t)segment_offset;
+            extern int mcpx_apu_addr_wraps(uint32_t a);
+            if (a >= 0x74000000u && a < 0x7FFE0000u && apu_ssl_log()) {
+                static unsigned dumped;
+                if (dumped++ < 60) {
+                    const uint8_t *p = mcpx_apu_phys(a);
+                    fprintf(stderr, "[SSLD] v%u seg %08X len %08X:", v, a, segment_length);
+                    for (int k = 0; k < 80; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", p[k]);
+                    fprintf(stderr, "\n");
+                }
+            }
+            if (!play_wrap && mcpx_apu_addr_wraps(a)) {
+                static unsigned logged;
+                if (logged < 16) {
+                    logged++;
+                    fprintf(stderr, "[APU] voice %u: stream segment %08X len %u "
+                            "(ssl %d seg %d page %d count %d sslbase %08X) is past "
+                            "RAM: silenced\n", v, (unsigned)segment_offset,
+                            (unsigned)seg_len, ssl_index, ssl_seg, page, count,
+                            (unsigned)d->regs[NV_PAPU_VPSSLADDR]);
+                    /* the same entry through each backing */
+                    extern uint8_t *g_apu_ram_ptr;
+                    extern const char *mcpx_apu_phys_class(uint64_t addr);
+                    uint32_t ea = (uint32_t)(d->regs[NV_PAPU_VPSSLADDR] + page * 8);
+                    const uint32_t *lo = (const uint32_t *)(g_apu_ram_ptr + ea);
+                    const uint32_t *wi = (const uint32_t *)(g_apu_ram_ptr + 0x80000000u + ea);
+                    fprintf(stderr, "[APU]   entry %08X class %s: ram %08X/%08X win %08X/%08X "
+                            "base %d/%d count %d/%d\n", ea, mcpx_apu_phys_class(ea),
+                            lo[0], lo[1], wi[0], wi[1],
+                            d->vp.ssl[v].base[0], d->vp.ssl[v].base[1],
+                            d->vp.ssl[v].count[0], d->vp.ssl[v].count[1]);
+                }
+                silent_seg = true;
+            }
+        }
     }
 
     bool adpcm =
@@ -1193,6 +1267,23 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     }
     block_size *= samples_per_block;
 
+    /* the fast path reads the whole segment from its start's backing; only
+     * where that backing really runs to the segment's end (else page by page,
+     * as before -- a read past a mapping's end faults) */
+    if (stream && seg_host && !silent_seg && seg_len > 0) {
+        size_t bytes = adpcm ? ((size_t)(seg_len + ADPCM_SAMPLES_PER_BLOCK - 1) /
+                                ADPCM_SAMPLES_PER_BLOCK) * block_size
+                             : (size_t)seg_len * block_size;
+        extern int mcpx_apu_span_ok(uint64_t start, size_t bytes);
+        if (!mcpx_apu_span_ok(segment_offset, bytes)) {
+            static unsigned warned;
+            if (warned++ < 8)
+                fprintf(stderr, "[APU] voice %u: segment %08X (%zu bytes) not contiguous "
+                        "on the host: read page by page\n", v, (unsigned)segment_offset, bytes);
+            seg_host = NULL;
+        }
+    }
+
     int sample_count = 0;
     hwaddr stat_addr = 0;
     for (; (sample_count < num_samples_requested) && (cbo <= ebo);
@@ -1204,15 +1295,21 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                : get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
                                               0xFFFFFFFF, ba + lin);
         }
+        if (silent_seg) {
+            samples[sample_count][0] = samples[sample_count][1] = 0.0f;
+            continue;
+        }
         if (adpcm) {
             unsigned int block_index = cbo / ADPCM_SAMPLES_PER_BLOCK;
             unsigned int block_position = cbo % ADPCM_SAMPLES_PER_BLOCK;
             if (adpcm_block_index != (int)block_index) {
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
-                if (stream) {
-                    hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
-                           block_size);
+                if (stream && seg_host) {
+                    memcpy(adpcm_block, seg_host + linear_addr, block_size);
+                } else if (stream) {
+                    for (unsigned int k = 0; k < block_size / 4; k++)
+                        adpcm_block[k] = ldl_le_phys(address_space_memory,
+                                                     segment_offset + linear_addr + k * 4);
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
@@ -1236,13 +1333,29 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     adpcm_decoded[block_position * channels + 1]);
             }
         } else {
-            hwaddr addr;
-            if (stream) {
-                addr = segment_offset + cbo * block_size;
+            hwaddr addr = 0;
+            const uint8_t *hp = NULL;
+            if (stream && seg_host) {
+                hp = seg_host + cbo * block_size;
+            } else if (stream) {
+                addr = segment_offset + cbo * (uint32_t)block_size;
             } else {
                 uint32_t linear_addr = ba + cbo * (uint32_t)block_size;
                 addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
                                     linear_addr);
+                /* nv2a-port: the host pointer once per 4 KB page, not a full
+                 * address translation (mcpx_apu_phys) per sample and channel
+                 * -- a third of the audio thread. A sample frame that crosses
+                 * a page keeps the per-access path. NV2A_APU_NO_PAGECACHE=1 */
+                static int nopc = -1;
+                if (nopc < 0) nopc = getenv("NV2A_APU_NO_PAGECACHE") != NULL;
+                if (!nopc && (addr & 0xFFF) + block_size <= 0x1000) {
+                    if ((addr >> 12) != pc_page) {
+                        pc_page = addr >> 12;
+                        pc_host = mcpx_apu_phys(addr & ~(hwaddr)0xFFF);
+                    }
+                    hp = pc_host + (addr & 0xFFF);
+                }
             }
 
             for (unsigned int channel = 0; channel < channels; channel++) {
@@ -1250,19 +1363,22 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(address_space_memory, addr);
+                    ival = hp ? hp[0] : ldub_phys(address_space_memory, addr);
                     fval = uint8_to_float((uint8_t)(ival & 0xff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(address_space_memory, addr);
+                    if (hp) { uint16_t w; memcpy(&w, hp, 2); ival = w; }
+                    else ival = lduw_le_phys(address_space_memory, addr);
                     fval = int16_to_float((int16_t)(ival & 0xffff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    if (hp) memcpy(&ival, hp, 4);
+                    else ival = ldl_le_phys(address_space_memory, addr);
                     fval = int24_to_float(ival);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    if (hp) memcpy(&ival, hp, 4);
+                    else ival = ldl_le_phys(address_space_memory, addr);
                     fval = int32_to_float(ival);
                     break;
                 default:
@@ -1271,6 +1387,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 }
                 samples[sample_count][channel] = fval;
                 addr += container_size;
+                if (hp) hp += container_size;
             }
         }
 
@@ -1497,6 +1614,20 @@ static void voice_process(MCPXAPUState *d,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
     if (!active) return;
 
+    {   /* per voice, decaying: its own level and how noise-like it is (the
+         * share of sign changes between samples: speech and music sit low,
+         * hiss near 0.5) -- listed on REC */
+        extern float g_vstat_peak[MCPX_HW_MAX_VOICES], g_vstat_zcr[MCPX_HW_MAX_VOICES];
+        float pk = 0; int zc = 0;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = samples[i][0] < 0 ? -samples[i][0] : samples[i][0];
+            if (a > pk) pk = a;
+            if (i && ((samples[i][0] < 0) != (samples[i - 1][0] < 0))) zc++;
+        }
+        g_vstat_peak[v] = g_vstat_peak[v] * 0.995f + pk * 0.005f;
+        if (pk > 0.01f) g_vstat_zcr[v] = g_vstat_zcr[v] * 0.99f + (zc / (float)NUM_SAMPLES_PER_FRAME) * 0.01f;
+    }
+
     /* Get volume bins */
     int bin[8];
     bin[0] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V0BIN);
@@ -1643,6 +1774,10 @@ static void voice_process(MCPXAPUState *d,
  * clock; set against the flip count it shows whether audio runs fast or
  * slow relative to the frames. */
 static unsigned s_pos_frames;
+uint32_t g_vseg[MCPX_HW_MAX_VOICES], g_vseg_len[MCPX_HW_MAX_VOICES];
+float g_vstat_peak[MCPX_HW_MAX_VOICES], g_vstat_zcr[MCPX_HW_MAX_VOICES];
+unsigned g_apu_sum_pause[2];
+float g_apu_out_peak;
 
 static void vp_trace_positions(MCPXAPUState *d)
 {
@@ -1710,6 +1845,96 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
 
+    {   /* always: every 5 s, how many voices play, how many sit paused,
+         * how loud the voice mix is (a sound that goes silent: voices
+         * stuck paused, playing at zero, or none at all) */
+        static unsigned frames, act_acc, pau_acc;
+        static float peak;
+        unsigned act = 0, pau = 0;
+        for (int list = 0; list < 3; list++) {
+            uint32_t h = d->regs[voice_list_regs[list].top];
+            for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+                uint16_t v = (uint16_t)h;
+                if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                    act++;
+                    if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED)) pau++;
+                }
+                h = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK, NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            }
+        }
+        act_acc += act; pau_acc += pau;
+        {   /* REC: every active voice as it stands */
+            extern volatile int g_apu_wav_request;
+            static int listed;
+            if (g_apu_wav_request && !listed) {
+                listed = 1;
+                for (int list = 0; list < 3; list++) {
+                    uint32_t h = d->regs[voice_list_regs[list].top];
+                    for (int i = 0; h != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+                        uint16_t v = (uint16_t)h;
+                        if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                            uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu);
+                            extern float g_vstat_peak[], g_vstat_zcr[];
+                            extern uint32_t g_vseg[], g_vseg_len[];
+                            extern const char *mcpx_apu_phys_class(uint64_t addr);
+                            if (fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) {
+                                uint32_t sa = g_vseg[v], sl = g_vseg_len[v] & 0xFFFF;
+                                fprintf(stderr, "[APU-VOICE]   voice %u stream segment %08X..%08X: start %s, end %s\n",
+                                        (unsigned)v, sa, sa + sl * 2, mcpx_apu_phys_class(sa), mcpx_apu_phys_class(sa + sl * 2));
+                                /* what each backing holds there: real PCM has a low
+                                 * zero-crossing rate, the wrong backing reads as noise */
+                                extern uint8_t *g_apu_ram_ptr;
+                                const uint8_t *cand[3] = { g_apu_ram_ptr + (sa & 0x03FFFFFFu),
+                                    (sa & 0x0FFFFFFFu) < (64u << 20) ? g_apu_ram_ptr + 0x80000000u + (sa & 0x03FFFFFFu) : NULL,
+                                    mcpx_apu_phys(sa) };
+                                const char *cn[3] = { "ram", "win", "used" };
+                                for (int c = 0; c < 3; c++) {
+                                    if (!cand[c]) continue;
+                                    const int16_t *pcm = (const int16_t *)cand[c];
+                                    unsigned n = sl * 2 > 4096 ? 4096 : sl * 2, zc = 0, big = 0; double sum = 0;
+                                    if (n < 2) continue;
+                                    for (unsigned k = 1; k < n; k++) {
+                                        if ((pcm[k] >= 0) != (pcm[k - 1] >= 0)) zc++;
+                                        if (abs(pcm[k] - pcm[k - 1]) > 12000) big++;
+                                        sum += abs(pcm[k]);
+                                    }
+                                    fprintf(stderr, "[APU-VOICE]     %s: zcr %.2f jumps %u mean %.0f\n",
+                                            cn[c], (double)zc / n, big, sum / n);
+                                }
+                            }
+                            fprintf(stderr, "[APU-VOICE] level %.3f noise %.2f list %d voice %u fmt %08x (%s%s%s cont %u size %u) paused %u pos %u/%u pitch %u vol %08x\n",
+                                    g_vstat_peak[v], g_vstat_zcr[v], list, (unsigned)v, fmt,
+                                    (fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) ? "stream" : "buffer",
+                                    (fmt & NV_PAVS_VOICE_CFG_FMT_STEREO) ? " stereo" : "",
+                                    (fmt & NV_PAVS_VOICE_CFG_FMT_LOOP) ? " loop" : "",
+                                    (fmt >> 30) & 3, (fmt >> 28) & 3,
+                                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED),
+                                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                                    voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK, 0xFFFF0000u),
+                                    voice_get_mask(d, v, NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFFu));
+                        }
+                        h = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK, NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+                    }
+                }
+            }
+            if (!g_apu_wav_request) listed = 0;
+        }
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i += 4) {
+                float a = mixbins[b][i] < 0 ? -mixbins[b][i] : mixbins[b][i];
+                if (a > peak) peak = a;
+            }
+        if (++frames >= 7500) {   /* 1500 frames a second */
+            extern unsigned g_apu_sum_pause[2];
+            extern float g_apu_out_peak;
+            fprintf(stderr, "[APU-SUM] voices %.1f active, %.1f paused; voice mix peak %.3f, output peak %.3f; pause cmds %u on / %u off\n",
+                    act_acc / (float)frames, pau_acc / (float)frames, peak, g_apu_out_peak,
+                    g_apu_sum_pause[1], g_apu_sum_pause[0]);
+            frames = act_acc = pau_acc = 0; peak = 0; g_apu_out_peak = 0;
+            g_apu_sum_pause[0] = g_apu_sum_pause[1] = 0;
+        }
+    }
     vp_trace_positions(d);
     vp_stat_report();
     if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)

@@ -165,6 +165,17 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         return;
     if (s_dsp_ack_auto) {
         uint32_t *slot = dsp_ack_auto_slot(d);
+        /* Only a DSOUND command word (small: 2, 3, ...) is acked. Once a
+         * title frees the scratch block the table's first entry is whatever
+         * reused that memory, and clearing any non-zero dword there zeroed
+         * live game data every frame (wild ICALLs, then a crash). */
+        if (slot && *slot && *slot > 0x40u) {
+            static int warned;
+            if (warned++ < 3)
+                fprintf(stderr, "[APU] DSP doorbell (auto): 0x%08X is not a "
+                                "command; left alone\n", *slot);
+            slot = NULL;
+        }
         if (slot && *slot) {
             static int shown;
             if (shown++ < 3)
