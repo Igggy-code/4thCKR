@@ -89,6 +89,11 @@ extern "C" {
 void xbox_InputKeySet(int vk, int down);
 /* Release every key (focus lost). */
 void xbox_InputKeysClear(void);
+/* On-screen pad: analog_idx 0..7 = A B X Y Black White LT RT (-1 none),
+ * wbutton = XBOX_GAMEPAD_* digital bits; axis 0..3 = LX LY RX RY, -1..1
+ * with +Y up. Merged into the keyboard pad. */
+void xbox_InputTouchButton(int analog_idx, int wbutton, int down);
+void xbox_InputTouchAxis(int axis, float v);
 
 /* For the Win32 window (fb_present.c), here so every host tests them.
  *

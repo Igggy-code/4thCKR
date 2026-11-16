@@ -1,3 +1,4 @@
+#include <time.h>
 /**
  * Xbox Input Compatibility Layer
  *
@@ -318,11 +319,21 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSTICK))  btn |= XBOX_GAMEPAD_LEFT_THUMB;
     if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = btn;
+    if (btn & XBOX_GAMEPAD_START) {   /* the pause screen goes up on it (conker main.c) */
+        extern volatile int64_t g_xbox_start_ms;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        g_xbox_start_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+    }
 
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_B) ? 255 : 0;
+    if (pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]) {
+        extern volatile int64_t g_xbox_b_ms;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        g_xbox_b_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+    }
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_X) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =

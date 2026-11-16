@@ -1,3 +1,4 @@
+#include <time.h>
 /*
  * The keyboard as a pad on port 0. See keyboard.h.
  *
@@ -161,6 +162,42 @@ void xbox_InputKeyboardBindings(InputBindings *b)
     }
 }
 
+/* On-screen pad (Android overlay): written by the UI thread, merged into
+ * every poll. Plain stores; a torn read only lasts one poll. */
+static volatile XBOX_GAMEPAD s_touch_pad;
+
+/* when START was last down, from a pad or the overlay */
+volatile int64_t g_xbox_start_ms;
+volatile int64_t g_xbox_b_ms;   /* B: leaves the pause menu */
+
+void xbox_InputTouchButton(int analog_idx, int wbutton, int down)
+{
+    if (((wbutton & 0x10) || analog_idx == 1) && down) {
+        extern volatile int64_t g_xbox_b_ms;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t t = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+        if (wbutton & 0x10) g_xbox_start_ms = t; else g_xbox_b_ms = t;
+    }
+    if (analog_idx >= 0 && analog_idx < 8)
+        s_touch_pad.bAnalogButtons[analog_idx] = down ? 255 : 0;
+    if (wbutton) {
+        if (down) s_touch_pad.wButtons |= (WORD)wbutton;
+        else      s_touch_pad.wButtons &= (WORD)~wbutton;
+    }
+}
+
+void xbox_InputTouchAxis(int axis, float v)
+{
+    if (v > 1.0f) v = 1.0f; if (v < -1.0f) v = -1.0f;
+    SHORT s = (SHORT)(v * 32767.0f);
+    switch (axis) {
+    case 0: s_touch_pad.sThumbLX = s; break;
+    case 1: s_touch_pad.sThumbLY = s; break;
+    case 2: s_touch_pad.sThumbRX = s; break;
+    case 3: s_touch_pad.sThumbRY = s; break;
+    }
+}
+
 void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
 {
     static DWORD packet;
@@ -177,6 +214,11 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
      * these as a pressure never sees a press if they are 1), stick keys
      * are full deflection and opposite keys cancel. */
     xbox_InputMap_KeysResolve(&b, down, &out->Gamepad);
+    {
+        XBOX_GAMEPAD t;
+        memcpy(&t, (const void *)&s_touch_pad, sizeof t);
+        xbox_InputMap_PadMerge(&out->Gamepad, &t);
+    }
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */

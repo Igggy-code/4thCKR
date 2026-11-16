@@ -59,9 +59,9 @@ extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 #else
 #  define OHCI_TLS __thread
 #endif
-extern OHCI_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern OHCI_TLS uint32_t g_ebx, g_esi, g_edi;
-extern OHCI_TLS uint32_t g_fs_base;
+#include "../kernel/recomp_cpu_tls.h" /* was: extern OHCI_TLS uint32_t g_eax, g_ecx, g_edx, g_esp; */
+#include "../kernel/recomp_cpu_tls.h" /* was: extern OHCI_TLS uint32_t g_ebx, g_esi, g_edi; */
+#include "../kernel/recomp_cpu_tls.h" /* was: extern OHCI_TLS uint32_t g_fs_base; */
 extern uint32_t xbox_AllocThreadTib(void);
 
 /* The vector XPP takes for USB0. HalGetInterruptVector(1) returns 1 here, and
@@ -261,7 +261,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
          * a driver polls for exactly that. Leaving it set is a hang, and it
          * is the first thing a driver does, so it would be the only thing
          * anyone ever saw of this file. */
-        *r |= v;
+        __atomic_or_fetch(r, v, __ATOMIC_SEQ_CST);
         if (*r & CS_HCR) {
             *r &= ~CS_HCR;
             hc->reg[HcControl / 4] &= ~0xC0u;    /* back to UsbReset state  */
@@ -286,7 +286,12 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
         }
-        *r &= ~v;                       /* write 1 to clear                 */
+        /* Atomic: the service thread sets bits in this word concurrently;
+         * a plain read-modify-write here dropped a WDH it had just raised,
+         * the next pass wrote a second done list over the unacknowledged
+         * one, and the driver's pending list ended up a cycle (the USB DPC
+         * spinning in sub_0055FDF5 forever). */
+        __atomic_and_fetch(r, ~v, __ATOMIC_SEQ_CST);  /* write 1 to clear */
         hc->ack_seq++;
         return;
 
@@ -357,7 +362,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             if (*ps & PORT_CCS)
                 *ps |= PORT_PES;
             *ps |= PORT_PRSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], INTR_RHSC, __ATOMIC_SEQ_CST);
         }
         return;
     }
@@ -714,6 +719,69 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
  * delivers its reports on an interrupt endpoint, and those EDs hang off the
  * HCCA interrupt table rather than HcControlHeadED. Walking only the control
  * list enumerates a device perfectly and then never hears from it again. */
+/* Retirement history, for the stall dump below. */
+typedef struct { uint32_t pass, ed, td, cc, next, info, head, tail, done; } OhciRetire;
+static OhciRetire s_ret[64];
+static unsigned   s_ret_n, s_pass;
+
+static void ohci_dump_td(const char *tag, uint32_t td)
+{
+    if (!guest_ok(td, 32)) {
+        fprintf(stderr, "  [OHCISTALL]   %s %08X (not guest memory)\n", tag, td);
+        return;
+    }
+    fprintf(stderr, "  [OHCISTALL]   %s %08X: %08X %08X %08X %08X | %08X %08X %08X %08X\n",
+            tag, td, rd32(td), rd32(td + 4), rd32(td + 8), rd32(td + 12),
+            rd32(td + 16), rd32(td + 20), rd32(td + 24), rd32(td + 28));
+}
+
+static void ohci_dump_list(const char *name, uint32_t ed)
+{
+    int guard = 0;
+    while (guest_ok(ed, 16) && ++guard < 16) {
+        uint32_t tail = rd32(ed + 4) & ED_PTR_MASK, head = rd32(ed + 8);
+        uint32_t td = head & ED_PTR_MASK;
+        int n = 0;
+        fprintf(stderr, "  [OHCISTALL] %s ED %08X info=%08X tail=%08X head=%08X next=%08X\n",
+                name, ed, rd32(ed), rd32(ed + 4), head, rd32(ed + 12));
+        while (guest_ok(td, 16) && n++ < 10) {
+            ohci_dump_td(td == tail ? "tail" : "td", td);
+            if (td == tail) break;
+            td = rd32(td + 8) & ED_PTR_MASK;
+        }
+        ed = rd32(ed + 12) & ED_PTR_MASK;
+    }
+}
+
+static void ohci_stall_dump(OhciController *hc)
+{
+    uint32_t hcca = hc->reg[HcHCCA / 4];
+    fprintf(stderr, "  [OHCISTALL] no retirement for %u passes; status=%08X enable=%08X "
+                    "control=%08X donehead=%08X hcca_done=%08X\n",
+            s_pass - s_ret[(s_ret_n - 1) & 63].pass,
+            hc->reg[HcInterruptStatus / 4], hc->reg[HcInterruptEnable / 4],
+            hc->reg[HcControl / 4], hc->reg[HcDoneHead / 4],
+            hcca ? rd32(hcca + HCCA_DONE_HEAD) : 0);
+    for (unsigned i = s_ret_n > 64 ? s_ret_n - 64 : 0; i < s_ret_n; i++) {
+        OhciRetire *r = &s_ret[i & 63];
+        fprintf(stderr, "  [OHCISTALL] ret#%u pass %u ED %08X TD %08X cc=%X info=%08X "
+                        "next=%08X head=%08X tail=%08X donelink=%08X\n",
+                i, r->pass, r->ed, r->td, r->cc, r->info, r->next, r->head, r->tail, r->done);
+    }
+    for (unsigned i = s_ret_n > 12 ? s_ret_n - 12 : 0; i < s_ret_n; i++)
+        ohci_dump_td("retired", s_ret[i & 63].td);
+    if (hcca)
+        for (int slot = 0; slot < 32; slot++) {
+            uint32_t ed = rd32(hcca + slot * 4) & ED_PTR_MASK;
+            if (ed && (slot == 0 || ed != (rd32(hcca + (slot - 1) * 4) & ED_PTR_MASK))) {
+                char nm[16]; snprintf(nm, sizeof nm, "int%d", slot);
+                ohci_dump_list(nm, ed);
+            }
+        }
+    ohci_dump_list("ctrl", hc->reg[HcControlHeadED / 4] & ED_PTR_MASK);
+    fflush(stderr);
+}
+
 static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
 {
     int completed = 0, guard = 0;
@@ -741,6 +809,12 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             uint32_t td = head & ED_PTR_MASK;
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
             uint32_t cc = ohci_do_td(hc, ed0, td);
+            {
+                OhciRetire *r = &s_ret[s_ret_n++ & 63];
+                r->pass = s_pass; r->ed = ed; r->td = td; r->cc = cc;
+                r->next = next; r->info = rd32(td); r->head = head;
+                r->tail = tail; r->done = *done_head;
+            }
 
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
@@ -770,7 +844,7 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
     hc->reg[HcDoneHead / 4] = done_head;
-    hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+    __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], INTR_WDH, __ATOMIC_SEQ_CST);
 }
 
 /* Both runners add to the caller's done queue rather than publishing their
@@ -970,7 +1044,7 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     uint32_t enable = hc->reg[HcInterruptEnable / 4];
     int claimed;
 
-    hc->reg[HcInterruptStatus / 4] |= source;
+    __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], source, __ATOMIC_SEQ_CST);
 
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
@@ -1090,6 +1164,15 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
 
         Sleep(OHCI_TICK_MS);
+        s_pass++;
+        {
+            static int dumped;
+            if (s_ret_n > 32 && !dumped
+             && s_pass - s_ret[(s_ret_n - 1) & 63].pass > 750) {   /* ~3 s */
+                dumped = 1;
+                ohci_stall_dump(hc);
+            }
+        }
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
@@ -1118,7 +1201,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], INTR_RHSC, __ATOMIC_SEQ_CST);
             plugged = 1;
             s_plugged_pads = 1;
             first_port = port;
@@ -1136,7 +1219,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             if (++settle > 50) {                 /* ~1 s after the last */
                 unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], INTR_RHSC, __ATOMIC_SEQ_CST);
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
                         s_plugged_pads + 1, port + 1, 10);
                 fflush(stderr);
@@ -1168,7 +1251,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
                 wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+            __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], INTR_SF, __ATOMIC_SEQ_CST);
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
@@ -1210,13 +1293,13 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
             if (ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
                               &pass_done))
-                hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
+                __atomic_and_fetch(&hc->reg[HcCommandStatus / 4], ~0x04u, __ATOMIC_SEQ_CST);   /* BLF consumed */
         }
 
         if ((control & 0x10u)
          && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
             if (ohci_run_control_list(hc, &pass_done))
-                hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
+                __atomic_and_fetch(&hc->reg[HcCommandStatus / 4], ~0x02u, __ATOMIC_SEQ_CST);   /* CLF consumed */
         }
 
         /* One done queue per pass, covering all three lists.
