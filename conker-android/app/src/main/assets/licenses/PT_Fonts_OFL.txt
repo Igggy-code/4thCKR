@@ -1,0 +1,4 @@
+PT Sans Caption Bold and PT Serif Bold Italic
+Copyright (c) 2009-2010 ParaType Ltd. (www.paratype.com), with Reserved Font Names "PT Sans" and "PT Serif".
+Licensed under the SIL Open Font License, Version 1.1 (https://openfontlicense.org).
+Used for the launcher screens and, rendered to bitmaps, for the Cyrillic letters of the Russian text patch.
