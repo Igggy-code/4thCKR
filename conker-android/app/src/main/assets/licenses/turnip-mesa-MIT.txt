@@ -1,0 +1,24 @@
+Built-in Vulkan driver for Adreno GPUs (assets/gpu_drivers/turnip_mrpurple_T30.zip)
+
+Turnip, the open-source Vulkan driver for Qualcomm Adreno GPUs, part of Mesa 3D
+(https://www.mesa3d.org). Build "Turnip Adreno Driver T30" (Mesa 26.3.0-T30) by Mr_Purple_666
+(https://github.com/MrPurple666/purple-turnip), shipped unmodified.
+
+Mesa is licensed under the MIT license:
+
+Copyright (C) The Mesa 3D authors and contributors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated documentation files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
