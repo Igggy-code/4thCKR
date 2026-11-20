@@ -41,7 +41,7 @@
 #include "constants.h"
 #include "glsl.h"
 
-#define HAVE_EXTERNAL_MEMORY 1
+#define HAVE_EXTERNAL_MEMORY 0  /* nv2a-port: frames go to the host swapchain, not GL */
 
 typedef struct QueueFamilyIndices {
     int queue_family;
@@ -78,6 +78,7 @@ typedef struct PipelineBinding {
     VkRenderPass render_pass;
     unsigned int draw_time;
     bool has_dynamic_line_width;
+    struct AsyncPipeJob *async_job;   /* nv2a-port: being built in the background */
 } PipelineBinding;
 
 enum Buffer {
@@ -92,6 +93,8 @@ enum Buffer {
     BUFFER_VERTEX_INLINE_STAGING,
     BUFFER_UNIFORM,
     BUFFER_UNIFORM_STAGING,
+    BUFFER_SURF_UPLOAD,
+    BUFFER_VERTEX_REMAP,   /* nv2a-port: repacked attributes kept across frames */
     BUFFER_COUNT
 };
 
@@ -104,10 +107,18 @@ typedef struct StorageBuffer {
     size_t buffer_offset;
     size_t buffer_size;
     uint8_t *mapped;
+    size_t slot_lo, slot_hi;   /* nv2a-port: this frame slot's part */
 } StorageBuffer;
 
 typedef struct SurfaceBinding {
     QTAILQ_ENTRY(SurfaceBinding) entry;
+    unsigned scale;   /* nv2a-port: this surface's render scale (0: global) */
+    bool scale_stale; /* nv2a-port: to be recreated at another scale */
+    /* nv2a-port: hash of the guest RAM we last made equal to the image
+     * (read-back landed, or uploaded from): RAM still hashing the same
+     * means the image is not older than RAM, so no re-upload is needed */
+    uint64_t ram_hash;
+    bool ram_hash_valid;
     MemAccessCallback *access_cb;
 
     hwaddr vram_addr;
@@ -126,8 +137,10 @@ typedef struct SurfaceBinding {
     bool cleared;
     int frame_time;
     int draw_time;
+    int read_time;    /* nv2a-port: last draw_time a command buffer copied from it */
     bool draw_dirty;
     bool download_pending;
+    bool eager_pending;   /* nv2a-port: read back at the next flip */
     bool upload_pending;
 
     BasicSurfaceFormatInfo fmt;
@@ -210,6 +223,8 @@ typedef struct TextureKey {
 } TextureKey;
 
 typedef struct TextureBinding {
+    uint32_t dirty_gen_checked;   /* nv2a-port: nv2a_tex_dirty_gen at the last check */
+    uint32_t rehash_epoch;        /* nv2a-port: nv2a_tex_rehash_epoch at the last full check */
     LruNode node;
     TextureKey key;
     VkImage image;
@@ -218,6 +233,7 @@ typedef struct TextureBinding {
     VmaAllocation allocation;
     VkSampler sampler;
     bool possibly_dirty;
+    uint32_t clean_epoch;   /* nv2a-port: page-epoch at the last clean check */
     uint64_t hash;
     unsigned int draw_time;
     uint32_t submit_time;
@@ -286,6 +302,7 @@ typedef struct PGRAPHVkDisplayState {
     int width, height;
     int draw_time;
 
+#if HAVE_EXTERNAL_MEMORY
     // OpenGL Interop
 #ifdef WIN32
     HANDLE handle;
@@ -294,6 +311,7 @@ typedef struct PGRAPHVkDisplayState {
 #endif
     GLuint gl_memory_obj;
     GLuint gl_texture_id;
+#endif
 } PGRAPHVkDisplayState;
 
 typedef struct ComputePipelineKey {
@@ -318,6 +336,11 @@ typedef struct PGRAPHVkComputeState {
     ComputePipeline *pipeline_cache_entries;
 } PGRAPHVkComputeState;
 
+struct PGRAPHVkState;
+void pgraph_vk_pipeline_cache_maybe_save(struct PGRAPHVkState *r, bool force);
+void pgraph_vk_spv_cache_stats(unsigned *hits, unsigned *misses);
+extern unsigned nv2a_pipelines_created;
+
 typedef struct PGRAPHVkState {
     uint32_t vk_api_version;
     VkInstance instance;
@@ -326,6 +349,9 @@ typedef struct PGRAPHVkState {
 
     bool debug_utils_extension_enabled;
     bool custom_border_color_extension_enabled;
+    bool image_compression_control_enabled;   /* nv2a-port: NV2A_NO_AFBC */
+    bool device_fault_enabled;                /* nv2a-port: VK_EXT_device_fault */
+    bool image_robustness_enabled;            /* nv2a-port: VK_EXT_image_robustness */
     bool memory_budget_extension_enabled;
 
     VkPhysicalDevice physical_device;
@@ -337,7 +363,7 @@ typedef struct PGRAPHVkState {
 
     VkQueue queue;
     VkCommandPool command_pool;
-    VkCommandBuffer command_buffers[2];
+    VkCommandBuffer command_buffers[4];
 
     VkCommandBuffer command_buffer;
     VkSemaphore command_buffer_semaphore;
@@ -349,7 +375,7 @@ typedef struct PGRAPHVkState {
     VkCommandBuffer aux_command_buffer;
     bool in_aux_command_buffer;
 
-    VkFramebuffer framebuffers[50];
+    VkFramebuffer framebuffers[200];
     int framebuffer_index;
     bool framebuffer_dirty;
 
@@ -366,7 +392,7 @@ typedef struct PGRAPHVkState {
 
     VkDescriptorPool descriptor_pool;
     VkDescriptorSetLayout descriptor_set_layout;
-    VkDescriptorSet descriptor_sets[1024];
+    VkDescriptorSet descriptor_sets[6144];
     int descriptor_set_index;
 
     StorageBuffer storage_buffers[BUFFER_COUNT];
@@ -405,6 +431,7 @@ typedef struct PGRAPHVkState {
     ShaderModuleInfo *quad_vert_module, *solid_frag_module;
     bool shader_bindings_changed;
     bool use_push_constants_for_uniform_attrs;
+    bool no_geometry_shader;   /* nv2a-port: GS-free path (Mali hangs on xemu's GS) */
 
     Lru shader_module_cache;
     ShaderModuleCacheEntry *shader_module_cache_entries;
@@ -423,6 +450,29 @@ typedef struct PGRAPHVkState {
     QSIMPLEQ_HEAD(, QueryReport) report_queue; // FIXME: Statically allocate
 
     SurfaceFormatInfo kelvin_surface_zeta_vk_map[3];
+
+    /* nv2a-port: two frames in flight. The frame being recorded owns slot
+     * `slot`; the other may still be on the GPU (slot_pending). Each slot
+     * has its own command buffers, fence, framebuffers, descriptor sets,
+     * query pool and half of every per-frame staging/stream buffer. */
+    int nslots;
+    int slot;
+    bool slot_pending[2];
+    VkCommandBuffer slot_cmd[2], slot_aux[2];
+    VkFence slot_fence[2];
+    VkSemaphore slot_sem[2];
+    VkFramebuffer slot_fbs[2][200];
+    int slot_fb_n[2];
+    VkQueryPool slot_qpool[2];
+    int slot_nq[2];
+    QSIMPLEQ_HEAD(, QueryReport) slot_reports[2];
+    bool slot_eager[2], slot_budget[2];
+    int slot_reason[2];
+    uint32_t slot_submit[2];
+    unsigned int slot_start[2];   /* command_buffer_start_time of the slot's frame */
+    unsigned long *cb_used_bitmap, *slot_used_bitmap[2];
+    uint32_t completed_submits;
+    int descriptor_set_base, descriptor_set_limit;
 
     uint32_t clear_parameter;
 
@@ -518,6 +568,12 @@ void pgraph_vk_surface_download_if_dirty(NV2AState *d, SurfaceBinding *surface);
 SurfaceBinding *pgraph_vk_surface_get_within(NV2AState *d, hwaddr addr);
 void pgraph_vk_wait_for_surface_download(SurfaceBinding *e);
 void pgraph_vk_download_dirty_surfaces(NV2AState *d);
+void pgraph_vk_download_eager_surfaces(NV2AState *d);
+void pgraph_vk_dump_surfaces(NV2AState *d, const char *tag);
+void nv2a_site_hit(const char *tag, void *ra, unsigned w, unsigned h);
+void pgraph_vk_wait_deferred(void);
+void pgraph_vk_stat_surface(NV2AState *d, SurfaceBinding *s, const char *label, int idx);
+void pgraph_vk_stat_all_surfaces(NV2AState *d, const char *label);
 unsigned int pgraph_vk_mark_surfaces_in_range_for_upload(NV2AState *d,
                                                          hwaddr start,
                                                          hwaddr size);
@@ -581,6 +637,7 @@ typedef enum FinishReason {
     VK_FINISH_REASON_FLIP_STALL,
     VK_FINISH_REASON_FLUSH,
     VK_FINISH_REASON_STALLED,
+    VK_FINISH_REASON_SEMAPHORE,
 } FinishReason;
 
 // draw.c
@@ -592,10 +649,21 @@ void pgraph_vk_draw_end(NV2AState *d);
 void pgraph_vk_finish(PGRAPHState *pg, FinishReason why);
 void pgraph_vk_flush_draw(NV2AState *d);
 void pgraph_vk_begin_command_buffer(PGRAPHState *pg);
+void pgraph_vk_poll_slots(void);
+void pgraph_vk_record_eager_readback(PGRAPHState *pg, int slot);
+void pgraph_vk_complete_eager_readback(NV2AState *d, int slot);
+unsigned int pgraph_vk_oldest_live_draw_time(PGRAPHVkState *r);
+void pgraph_vk_slot_select_buffers(PGRAPHVkState *r, int s);
+void pgraph_vk_slot_note_used(PGRAPHVkState *r, hwaddr addr, hwaddr size);
+void pgraph_vk_slot_wait_used(PGRAPHVkState *r, hwaddr addr, hwaddr size);
+void pgraph_vk_process_slot_reports(NV2AState *d, int s);
 void pgraph_vk_ensure_command_buffer(PGRAPHState *pg);
 void pgraph_vk_ensure_not_in_render_pass(PGRAPHState *pg);
 
 VkCommandBuffer pgraph_vk_begin_nondraw_commands(PGRAPHState *pg);
+void nv2a_vk_report_device_fault(PGRAPHVkState *r, const char *where);
+void nv2a_vk_image_no_compress(PGRAPHVkState *r, VkImageCreateInfo *ci,
+                               VkImageCompressionControlEXT *icc);
 void pgraph_vk_end_nondraw_commands(PGRAPHState *pg, VkCommandBuffer cmd);
 
 // blit.c
@@ -606,3 +674,31 @@ void pgraph_vk_determine_gpu_properties(NV2AState *d);
 GPUProperties *pgraph_vk_get_gpu_properties(void);
 
 #endif
+
+
+/* nv2a-port: per-surface render scale. At x2 only the frame-sized targets
+ * are scaled; the small ones (<= 256x256: shadow, blur, visibility
+ * buffers) stay native. pg->surface_scale_factor is the scale of whatever
+ * the code at hand works on: the bound targets while drawing, a given
+ * surface while it is created, copied, uploaded or read back. */
+extern unsigned nv2a_global_scale;
+unsigned pgraph_vk_scale_for_dims(unsigned w, unsigned h);
+typedef struct { PGRAPHState *pg; unsigned saved; } NV2AScaleSave;
+static inline NV2AScaleSave nv2a_scale_push(PGRAPHState *pg, const SurfaceBinding *s)
+{
+    NV2AScaleSave v = { pg, pg->surface_scale_factor };
+    if (s && s->scale) pg->surface_scale_factor = s->scale;
+    return v;
+}
+static inline void nv2a_scale_pop(NV2AScaleSave *v) { v->pg->surface_scale_factor = v->saved; }
+static inline NV2AScaleSave nv2a_scale_push_frame(PGRAPHState *pg, const SurfaceBinding *s)
+{
+    NV2AScaleSave v = { pg, pg->surface_scale_factor };
+    pg->surface_scale_factor = (s && s->scale) ? s->scale : nv2a_global_scale;
+    return v;
+}
+/* frame-sized work (the display): the surface's scale, or the global one */
+#define FRAME_SCALE_SCOPE(pg, s) \
+    NV2AScaleSave _nv2a_fs __attribute__((cleanup(nv2a_scale_pop))) = nv2a_scale_push_frame((pg), (s))
+#define SURF_SCALE_SCOPE(pg, s) \
+    NV2AScaleSave _nv2a_ss __attribute__((cleanup(nv2a_scale_pop))) = nv2a_scale_push((pg), (s))
