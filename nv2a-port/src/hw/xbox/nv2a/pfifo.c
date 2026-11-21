@@ -1,3 +1,5 @@
+#include <time.h>
+#include <sched.h>
 /*
  * QEMU Geforce NV2A implementation
  *
@@ -30,6 +32,7 @@ typedef struct RAMHTEntry {
 } RAMHTEntry;
 
 static void pfifo_run_pusher(NV2AState *d);
+static void pfifo_run_pusher_inner(NV2AState *d);
 static uint32_t ramht_hash(NV2AState *d, uint32_t handle);
 static RAMHTEntry ramht_lookup(NV2AState *d, uint32_t handle);
 
@@ -104,6 +107,57 @@ static bool can_fifo_access(NV2AState *d) {
            NV_PGRAPH_FIFO_ACCESS;
 }
 
+/* nv2a-port: the puller used to drop the PFIFO lock and take the PGRAPH
+ * lock around every method, and back: four atomic lock operations per
+ * method, ~56,000 methods a frame in Conker's heavy scenes -- an eighth of
+ * the pfifo thread. Now the pfifo thread takes PGRAPH once (keeping PFIFO,
+ * the same order the MMIO handlers use: PFIFO, then PGRAPH) and keeps both
+ * across methods until the pusher stops, or until another thread is
+ * waiting for either lock (it then gets them between two methods).
+ * NV2A_PULLER_DANCE=1: the old per-method dance. */
+static bool s_pg_held;        /* pfifo thread only */
+static int s_pg_dance = -1;
+static inline bool lock_wanted(NV2AState *d)
+{
+    return __atomic_load_n(&d->pfifo.lock.waiters, __ATOMIC_RELAXED) |
+           __atomic_load_n(&d->pgraph.lock.waiters, __ATOMIC_RELAXED);
+}
+static void puller_enter_pgraph(NV2AState *d)
+{
+    if (s_pg_dance < 0) s_pg_dance = getenv("NV2A_PULLER_DANCE") != NULL;
+    if (s_pg_dance) {
+        qemu_mutex_unlock(&d->pfifo.lock);
+        qemu_mutex_lock(&d->pgraph.lock);
+        return;
+    }
+    if (s_pg_held && lock_wanted(d)) {
+        qemu_mutex_unlock(&d->pgraph.lock);
+        qemu_mutex_unlock(&d->pfifo.lock);
+        sched_yield();
+        qemu_mutex_lock(&d->pfifo.lock);
+        s_pg_held = false;
+    }
+    if (!s_pg_held) {
+        qemu_mutex_lock(&d->pgraph.lock);
+        s_pg_held = true;
+    }
+}
+static void puller_leave_pgraph(NV2AState *d)
+{
+    if (s_pg_dance) {
+        qemu_mutex_unlock(&d->pgraph.lock);
+        qemu_mutex_lock(&d->pfifo.lock);
+    }
+}
+/* the PGRAPH lock back, before anything that takes it on its own */
+static void puller_release_pgraph(NV2AState *d)
+{
+    if (s_pg_held) {
+        qemu_mutex_unlock(&d->pgraph.lock);
+        s_pg_held = false;
+    }
+}
+
 /* If NV097_FLIP_STALL was executed, check if the flip has completed.
  * This will usually happen in the VSYNC interrupt handler.
  */
@@ -131,13 +185,17 @@ static bool pfifo_stall_for_flip(NV2AState *d)
     bool should_stall = false;
 
     if (qatomic_read(&d->pgraph.waiting_for_flip)) {
-        qemu_mutex_lock(&d->pgraph.lock);
+        bool held = s_pg_held;
+        if (!held) qemu_mutex_lock(&d->pgraph.lock);
         if (!is_flip_stall_complete(d)) {
             should_stall = true;
         } else {
+            extern void nv2a_tl(int, uint32_t);
+            nv2a_tl(15, 0);
             d->pgraph.waiting_for_flip = false;
+            { extern void xbox_FlipDone(void); xbox_FlipDone(); }
         }
-        qemu_mutex_unlock(&d->pgraph.lock);
+        if (!held) qemu_mutex_unlock(&d->pgraph.lock);
     }
 
     return should_stall;
@@ -188,9 +246,7 @@ static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
         SET_MASK(*engine_reg, 3 << (4*subchannel), entry.engine);
         SET_MASK(*pull1, NV_PFIFO_CACHE1_PULL1_ENGINE, entry.engine);
 
-        // TODO: this is fucked
-        qemu_mutex_unlock(&d->pfifo.lock);
-        qemu_mutex_lock(&d->pgraph.lock);
+        puller_enter_pgraph(d);
 
         // Switch contexts if necessary
         if (can_fifo_access(d)) {
@@ -202,8 +258,7 @@ static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
             }
         }
 
-        qemu_mutex_unlock(&d->pgraph.lock);
-        qemu_mutex_lock(&d->pfifo.lock);
+        puller_leave_pgraph(d);
 
     } else if (method >= 0x100) {
         // method passed to engine
@@ -223,18 +278,18 @@ static ssize_t pfifo_run_puller(NV2AState *d, uint32_t method_entry,
         assert(engine == ENGINE_GRAPHICS);
         SET_MASK(*pull1, NV_PFIFO_CACHE1_PULL1_ENGINE, engine);
 
-        // TODO: this is fucked
-        qemu_mutex_unlock(&d->pfifo.lock);
-        qemu_mutex_lock(&d->pgraph.lock);
+        puller_enter_pgraph(d);
 
         if (can_fifo_access(d)) {
             num_proc =
                 pgraph_method(d, subchannel, method, parameter, parameters,
                               num_words_available, max_lookahead_words, inc);
         }
+        {   extern volatile int nv2a_guard_req;
+            extern void pgraph_vk_service_guard(NV2AState *d);
+            if (nv2a_guard_req) pgraph_vk_service_guard(d); }
 
-        qemu_mutex_unlock(&d->pgraph.lock);
-        qemu_mutex_lock(&d->pfifo.lock);
+        puller_leave_pgraph(d);
     } else {
         assert(!"Unrecognized pfifo puller method");
     }
@@ -253,6 +308,12 @@ static bool pfifo_pusher_should_stall(NV2AState *d)
 }
 
 static void pfifo_run_pusher(NV2AState *d)
+{
+    pfifo_run_pusher_inner(d);
+    puller_release_pgraph(d);
+}
+
+static void pfifo_run_pusher_inner(NV2AState *d)
 {
     uint32_t *push0 = &d->pfifo.regs[NV_PFIFO_CACHE1_PUSH0];
     uint32_t *push1 = &d->pfifo.regs[NV_PFIFO_CACHE1_PUSH1];
@@ -453,13 +514,21 @@ static void pfifo_run_pusher(NV2AState *d)
     }
 }
 
+/* nv2a-port: the current NOP-trap wait (see the idle wait in pfifo_thread) */
+static struct timespec s_nop_ep;
+static int s_nop_on, s_nop_stage, s_nop_said;
+
 void *pfifo_thread(void *arg)
 {
     NV2AState *d = (NV2AState *)arg;
 
+    { extern void nv2a_rec_thread_enter(void); nv2a_rec_thread_enter(); }
     pgraph_init_thread(d);
 
     rcu_register_thread();
+    { extern void nv2a_hint_register_thread(void); nv2a_hint_register_thread(); }
+    { extern void nv2a_host_note_pfifo_thread(void); nv2a_host_note_pfifo_thread(); }
+    { extern void nv2a_sampler_register(int); nv2a_sampler_register(0); }
 
     qemu_mutex_lock(&d->pfifo.lock);
     while (true) {
@@ -473,11 +542,141 @@ void *pfifo_thread(void *arg)
 
         pgraph_process_pending_reports(d);
 
+        /* nv2a-port: take a NOP-notify trap's interrupt here, on this
+         * thread, instead of waiting for the delivery thread to run the
+         * guest ISR and then for a wakeup when it has acked (D3D's ISR
+         * clears the interrupt and re-enables FIFO access as two writes,
+         * and the second one's kick came ~120 us after this thread had gone
+         * to sleep on the first). Conker issues ~145 of these a frame as
+         * push-buffer callbacks. The glue serializes this with the delivery
+         * thread and declines (-1) while the one-CPU gate is held, and then
+         * the interrupt is delivered as before. NV2A_NO_NOP_INLINE=1 off. */
+        {
+            static int inl = -1;
+            extern int nv2a_glue_inline_isr(void);
+            if (inl < 0) inl = !getenv("NV2A_NO_NOP_INLINE");
+            if (inl && qatomic_read(&d->pgraph.waiting_for_nop)) {
+                qemu_mutex_unlock(&d->pfifo.lock);
+                int r = nv2a_glue_inline_isr();
+                qemu_mutex_lock(&d->pfifo.lock);
+                if (r >= 0 && !qatomic_read(&d->pgraph.waiting_for_nop)
+                    && can_fifo_access(d))
+                    continue;
+            }
+        }
+
         if (!d->pfifo.fifo_kick) {
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);
 
+            /* nv2a-port: a NOP-notify trap waits for the guest ISR to ack
+             * it (145 a frame in Conker's bar). Sleeping on the condvar
+             * added two wakeups (~80 us) to each round trip; spin briefly
+             * for the ack first. NV2A_NO_NOPSPIN=1 disables. */
+            static int nopspin = -1;
+            if (nopspin < 0) nopspin = !getenv("NV2A_NO_NOPSPIN");
+            if (nopspin && qatomic_read(&d->pgraph.waiting_for_nop)) {
+                struct timespec a, b;
+                clock_gettime(CLOCK_MONOTONIC, &a);
+                qemu_mutex_unlock(&d->pfifo.lock);
+                bool acked = false;
+                for (int i = 0;; i++) {
+                    /* acked means both writes: the interrupt cleared and
+                     * FIFO access back on */
+                    if (!qatomic_read(&d->pgraph.waiting_for_nop) && can_fifo_access(d)) { acked = true; break; }
+                    if ((i & 63) == 63) {
+                        clock_gettime(CLOCK_MONOTONIC, &b);
+                        if ((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec) > 400000L) break;
+                    }
+#if defined(__aarch64__)
+                    __asm__ volatile("yield");
+#endif
+                }
+                qemu_mutex_lock(&d->pfifo.lock);
+                clock_gettime(CLOCK_MONOTONIC, &b);
+                {
+                    extern double nv2a_pfifo_nopwait_ms_acc;
+                    nv2a_pfifo_nopwait_ms_acc += (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+                }
+                if (acked || d->pfifo.fifo_kick) continue;
+            }
+
             // Both the pusher and puller are waiting for some action
-            qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+            {   /* nv2a-port: deferred semaphore releases wait for their
+                 * frame on the GPU; nothing else to do, so wait here */
+                extern bool pgraph_vk_sem_deferred_pending(void);
+                extern void pgraph_vk_service_deferred_sems(NV2AState *d);
+                extern volatile int nv2a_guard_req;
+                extern void pgraph_vk_service_guard(NV2AState *d);
+                if (nv2a_guard_req) {
+                    qemu_mutex_unlock(&d->pfifo.lock);
+                    qemu_mutex_lock(&d->pgraph.lock);
+                    pgraph_vk_service_guard(d);
+                    qemu_mutex_unlock(&d->pgraph.lock);
+                    qemu_mutex_lock(&d->pfifo.lock);
+                    continue;
+                }
+                if (pgraph_vk_sem_deferred_pending()) {
+                    qemu_mutex_unlock(&d->pfifo.lock);
+                    qemu_mutex_lock(&d->pgraph.lock);
+                    pgraph_vk_service_deferred_sems(d);
+                    qemu_mutex_unlock(&d->pgraph.lock);
+                    qemu_mutex_lock(&d->pfifo.lock);
+                    continue;
+                }
+            }
+            {   /* nv2a-port: where the PFIFO thread's frame goes (GPERF) */
+                extern double nv2a_pfifo_idle_ms_acc, nv2a_pfifo_flipwait_ms_acc,
+                              nv2a_pfifo_nopwait_ms_acc;
+                extern unsigned nv2a_pfifo_nopwaits;
+                bool flip = qatomic_read(&d->pgraph.waiting_for_flip);
+                bool nop = qatomic_read(&d->pgraph.waiting_for_nop);
+                struct timespec a, b;
+                extern void nv2a_tl(int, uint32_t);
+                nv2a_tl(4, (flip ? 1 : 0) | (nop ? 2 : 0));
+                clock_gettime(CLOCK_MONOTONIC, &a);
+                if (nop) {
+                    /* nv2a-port: a long wait for the title's ack of a NOP
+                     * trap, timed from the first wait on this trap (the
+                     * thread wakes often in between): say who holds things
+                     * up, at 80 and 300 ms */
+                    if (!s_nop_on) { s_nop_ep = a; s_nop_on = 1; s_nop_stage = 0; }
+                    qemu_cond_timedwait(&d->pfifo.fifo_cond, &d->pfifo.lock, 40);
+                    clock_gettime(CLOCK_MONOTONIC, &b);
+                    double w = (b.tv_sec - s_nop_ep.tv_sec) * 1e3 + (b.tv_nsec - s_nop_ep.tv_nsec) / 1e6;
+                    if (s_nop_said < 80 && ((s_nop_stage == 0 && w > 40) || (s_nop_stage == 1 && w > 300))) {
+                        extern void xbox_DebugNopStall(double);
+                        s_nop_said++; s_nop_stage++;
+                        xbox_DebugNopStall(w);
+                    }
+                    if (!qatomic_read(&d->pgraph.waiting_for_nop)) s_nop_on = 0;
+                } else if (!flip) {
+                    /* nv2a-port: idle, waiting for the title's commands; a
+                     * long idle in play is the title stalled: who holds what
+                     * (at 150 ms, from the first wait of this idle stretch) */
+                    static struct timespec ie; static int ie_on, ie_said, ie_stage;
+                    s_nop_on = 0;
+                    if (!ie_on) { ie = a; ie_on = 1; ie_stage = 0; }
+                    bool got = qemu_cond_timedwait(&d->pfifo.fifo_cond, &d->pfifo.lock, 50);
+                    clock_gettime(CLOCK_MONOTONIC, &b);
+                    double w = (b.tv_sec - ie.tv_sec) * 1e3 + (b.tv_nsec - ie.tv_nsec) / 1e6;
+                    extern volatile int g_conker_in_level;
+                    if (!ie_stage && w > 150 && w < 2000 && ie_said < 60 && g_conker_in_level) {
+                        extern void xbox_DebugIdleStall(double);
+                        ie_said++; ie_stage = 1;
+                        xbox_DebugIdleStall(w);
+                    }
+                    if (got) ie_on = 0;
+                } else {
+                    s_nop_on = 0;
+                    qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
+                }
+                clock_gettime(CLOCK_MONOTONIC, &b);
+                nv2a_tl(5, 0);
+                double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+                if (flip) nv2a_pfifo_flipwait_ms_acc += ms;
+                else if (nop) { nv2a_pfifo_nopwait_ms_acc += ms; nv2a_pfifo_nopwaits++; }
+                else nv2a_pfifo_idle_ms_acc += ms;
+            }
         }
 
         if (d->exiting) {

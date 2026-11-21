@@ -148,6 +148,7 @@ static pthread_mutex_t s_timer_wake_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_timer_wake_cv;
 static pthread_once_t s_timer_wake_once = PTHREAD_ONCE_INIT;
 static int s_timer_wake_pending;
+static int s_timer_sleeping;
 
 static void timer_wake_init(void)
 {
@@ -168,7 +169,8 @@ void xbox_HostTimerSleepNs(uint64_t ns)
 {
     pthread_once(&s_timer_wake_once, timer_wake_init);
     pthread_mutex_lock(&s_timer_wake_lock);
-    if (ns && !s_timer_wake_pending) {
+    __atomic_store_n(&s_timer_sleeping, 1, __ATOMIC_SEQ_CST);
+    if (ns && !__atomic_load_n(&s_timer_wake_pending, __ATOMIC_SEQ_CST)) {
 #ifdef __APPLE__
         struct timespec rel = { (time_t)(ns / 1000000000u),
                                 (long)(ns % 1000000000u) };
@@ -186,12 +188,20 @@ void xbox_HostTimerSleepNs(uint64_t ns)
         pthread_cond_timedwait(&s_timer_wake_cv, &s_timer_wake_lock, &ts);
 #endif
     }
-    s_timer_wake_pending = 0;
+    __atomic_store_n(&s_timer_sleeping, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&s_timer_wake_pending, 0, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&s_timer_wake_lock);
 }
 
 void xbox_HostTimerWake(void)
 {
+    /* nv2a-port: lock and futex only when the timer thread is asleep (the
+     * pfifo thread queued ~150 DPCs a frame, a syscall each). Pairs with the
+     * sleeper's store of s_timer_sleeping and load of the pending flag. */
+    /* a wake still pending (not yet taken by the timer thread) covers this
+     * one: a burst of DPCs costs one futex, not one each */
+    if (__atomic_exchange_n(&s_timer_wake_pending, 1, __ATOMIC_SEQ_CST)) return;
+    if (!__atomic_load_n(&s_timer_sleeping, __ATOMIC_SEQ_CST)) return;
     pthread_once(&s_timer_wake_once, timer_wake_init);
     pthread_mutex_lock(&s_timer_wake_lock);
     s_timer_wake_pending = 1;
