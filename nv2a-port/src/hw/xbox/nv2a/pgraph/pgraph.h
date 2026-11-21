@@ -222,6 +222,9 @@ typedef struct PGRAPHState {
     uint16_t compressed_attrs;
     uint16_t uniform_attrs;
     uint16_t swizzle_attrs;
+    uint16_t w1_attrs;   /* nv2a-port: 3-comp attr widened to 4, w forced to 1 */
+    uint16_t int_attrs;  /* nv2a-port: SSCALED read as SINT, converted in shader */
+    uint16_t snorm_attrs;/* nv2a-port: SNORM16 read as SINT, normalised in shader */
 
     unsigned int inline_array_length;
     uint32_t inline_array[NV2A_MAX_BATCH_LENGTH];

@@ -28,13 +28,15 @@ uint32_t pgraph_rdi_read(PGRAPHState *pg, unsigned int select,
     switch(select) {
     case RDI_INDEX_VTX_CONSTANTS0:
     case RDI_INDEX_VTX_CONSTANTS1:
-        assert((address / 4) < NV2A_VERTEXSHADER_CONSTANTS);
+        /* nv2a-port: asserts are compiled out; a runaway reader (a wild
+         * guest loop polling RDI_DATA) walked off the array and crashed. */
+        if ((address / 4) >= NV2A_VERTEXSHADER_CONSTANTS) break;
         r = pg->vsh_constants[address / 4][3 - address % 4];
         break;
     default:
+        { static unsigned n; if (n++ < 8 || (n % 100000) == 0)
         fprintf(stderr, "nv2a: unknown rdi read select 0x%x address 0x%x\n",
-                select, address);
-        assert(!"Unknown rdi read select");
+                select, address); }
         break;
     }
     return r;
@@ -46,11 +48,11 @@ void pgraph_rdi_write(PGRAPHState *pg, unsigned int select,
     switch(select) {
     case RDI_INDEX_VTX_CONSTANTS0:
     case RDI_INDEX_VTX_CONSTANTS1:
-        assert(!"Untested vertex constants select"); /* Untested */
-        assert((address / 4) < NV2A_VERTEXSHADER_CONSTANTS);
+        if ((address / 4) >= NV2A_VERTEXSHADER_CONSTANTS) break;
         pg->vsh_constants_dirty[address / 4] |=
             (val != pg->vsh_constants[address / 4][3 - address % 4]);
         pg->vsh_constants[address / 4][3 - address % 4] = val;
+        { extern uint32_t nv2a_vsh_const_gen, nv2a_vsh_all_gen; nv2a_vsh_all_gen = ++nv2a_vsh_const_gen; }
         break;
     default:
         NV2A_DPRINTF("unknown rdi write select 0x%x, address 0x%x, val 0x%08x\n",

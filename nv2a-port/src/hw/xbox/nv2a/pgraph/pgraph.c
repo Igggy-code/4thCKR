@@ -86,6 +86,10 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     PGRAPHState *pg = &d->pgraph;
 
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
+    if (addr == NV_PGRAPH_INTR || addr == NV_PGRAPH_FIFO) {
+        extern void nv2a_tl(int, uint32_t);
+        nv2a_tl(addr == NV_PGRAPH_INTR ? 20 : 21, (uint32_t)val);
+    }
 
     qemu_mutex_lock(&d->pfifo.lock); // FIXME: Factor out fifo lock here
     qemu_mutex_lock(&pg->lock);
@@ -356,9 +360,12 @@ static void init_renderer(PGRAPHState *pg)
     exit(1);
 }
 
+volatile int nv2a_renderer_ready;   /* nv2a-port: present waits for this */
+
 void pgraph_init_thread(NV2AState *d)
 {
     init_renderer(&d->pgraph);
+    __atomic_store_n(&nv2a_renderer_ready, 1, __ATOMIC_RELEASE);
 }
 
 void pgraph_destroy(PGRAPHState *pg)
@@ -529,6 +536,7 @@ static const struct {
     static const size_t METHOD_RANGE_END_NAME(gclass, name) = \
         METHOD_ADDR(gclass, name) + 4*stride;
 #include "methods.h.inc"
+extern uint32_t nv2a_vsh_const_gen, nv2a_vsh_row_gen[], nv2a_vsh_all_gen;
 #undef DEF_METHOD
 #undef DEF_METHOD_RANGE
 #undef DEF_METHOD_CASE_4_OFFSET
@@ -690,6 +698,15 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
                                        NV_PGRAPH_CTX_SWITCH1_GRCLASS);
 
     pgraph_method_log(subchannel, graphics_class, method, parameter);
+    {   /* nv2a-port: NV2A_METHOD_TRACE=<n> logs the first n methods */
+        static long lim = -1, n;
+        if (lim < 0) lim = getenv("NV2A_METHOD_TRACE") ? atol(getenv("NV2A_METHOD_TRACE")) : 0;
+        if (n < lim) {
+            n++;
+            fprintf(stderr, "[pgraph] sc%u class %02X method %04X = %08X\n",
+                    subchannel, graphics_class, method, parameter);
+        }
+    }
 
     if (subchannel != 0) {
         // catches context switching issues on xbox d3d
@@ -851,6 +868,13 @@ DEF_METHOD(NV097, NO_OPERATION)
     if (parameter == 0) {
         return;
     }
+    {   /* nv2a-port: which software methods (CONKER_PROF/NV2A_PERF) */
+        extern uint32_t nv2a_nop_param[8]; extern unsigned nv2a_nop_cnt[8];
+        int k;
+        for (k = 0; k < 8 && nv2a_nop_cnt[k] && nv2a_nop_param[k] != parameter; k++) ;
+        if (k < 8) { nv2a_nop_param[k] = parameter; nv2a_nop_cnt[k]++; }
+        extern void nv2a_tl(int, uint32_t); nv2a_tl(16, parameter);
+    }
 
     unsigned channel_id =
         PG_GET_MASK(NV_PGRAPH_CTX_USER, NV_PGRAPH_CTX_USER_CHID);
@@ -924,6 +948,8 @@ DEF_METHOD(NV097, FLIP_STALL)
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);
     nv2a_profile_flip_stall();
+    { extern void nv2a_tl(int, uint32_t); nv2a_tl(14, 0); }
+    { extern void xbox_FlipStallBegin(void); xbox_FlipStallBegin(); }
     pg->waiting_for_flip = true;
 }
 
@@ -1764,7 +1790,7 @@ DEF_METHOD_INC(NV097, SET_PROJECTION_MATRIX)
     // pg->projection_matrix[slot] = *(float*)&parameter;
     unsigned int row = NV_IGRAPH_XF_XFCTX_PMAT0 + slot/4;
     pg->vsh_constants[row][slot%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pg->vsh_constants_dirty[row] = true; nv2a_vsh_row_gen[row] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_MODEL_VIEW_MATRIX)
@@ -1774,7 +1800,7 @@ DEF_METHOD_INC(NV097, SET_MODEL_VIEW_MATRIX)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_MMAT0 + matnum*8 + entry/4;
     pg->vsh_constants[row][entry % 4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pg->vsh_constants_dirty[row] = true; nv2a_vsh_row_gen[row] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_INVERSE_MODEL_VIEW_MATRIX)
@@ -1784,7 +1810,7 @@ DEF_METHOD_INC(NV097, SET_INVERSE_MODEL_VIEW_MATRIX)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_IMMAT0 + matnum*8 + entry/4;
     pg->vsh_constants[row][entry % 4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pg->vsh_constants_dirty[row] = true; nv2a_vsh_row_gen[row] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_COMPOSITE_MATRIX)
@@ -1792,7 +1818,7 @@ DEF_METHOD_INC(NV097, SET_COMPOSITE_MATRIX)
     int slot = (method - NV097_SET_COMPOSITE_MATRIX) / 4;
     unsigned int row = NV_IGRAPH_XF_XFCTX_CMAT0 + slot/4;
     pg->vsh_constants[row][slot%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pg->vsh_constants_dirty[row] = true; nv2a_vsh_row_gen[row] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_TEXTURE_MATRIX)
@@ -1802,7 +1828,7 @@ DEF_METHOD_INC(NV097, SET_TEXTURE_MATRIX)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_T0MAT + tex*8 + entry/4;
     pg->vsh_constants[row][entry%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pg->vsh_constants_dirty[row] = true; nv2a_vsh_row_gen[row] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_FOG_PARAMS)
@@ -1826,7 +1852,7 @@ DEF_METHOD_INC(NV097, SET_TEXGEN_PLANE_S)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_TG0MAT + tex*8 + entry/4;
     pg->vsh_constants[row][entry%4] = parameter;
-    pg->vsh_constants_dirty[row] = true;
+    pg->vsh_constants_dirty[row] = true; nv2a_vsh_row_gen[row] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD(NV097, SET_TEXGEN_VIEW_MODEL)
@@ -1839,7 +1865,7 @@ DEF_METHOD_INC(NV097, SET_FOG_PLANE)
 {
     int slot = (method - NV097_SET_FOG_PLANE) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_FOG][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_FOG] = true;
+    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_FOG] = true; nv2a_vsh_row_gen[NV_IGRAPH_XF_XFCTX_FOG] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_SPECULAR_PARAMS)
@@ -1860,7 +1886,7 @@ DEF_METHOD_INC(NV097, SET_VIEWPORT_OFFSET)
 {
     int slot = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_VPOFF][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPOFF] = true;
+    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPOFF] = true; nv2a_vsh_row_gen[NV_IGRAPH_XF_XFCTX_VPOFF] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_POINT_PARAMS)
@@ -1873,7 +1899,7 @@ DEF_METHOD_INC(NV097, SET_EYE_POSITION)
 {
     int slot = (method - NV097_SET_EYE_POSITION) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_EYEP][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_EYEP] = true;
+    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_EYEP] = true; nv2a_vsh_row_gen[NV_IGRAPH_XF_XFCTX_EYEP] = ++nv2a_vsh_const_gen;
 }
 
 DEF_METHOD_INC(NV097, SET_COMBINER_FACTOR0)
@@ -1910,8 +1936,16 @@ DEF_METHOD_INC(NV097, SET_VIEWPORT_SCALE)
 {
     int slot = (method - NV097_SET_VIEWPORT_SCALE) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_VPSCL][slot] = parameter;
-    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPSCL] = true;
+    pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPSCL] = true; nv2a_vsh_row_gen[NV_IGRAPH_XF_XFCTX_VPSCL] = ++nv2a_vsh_const_gen;
 }
+
+/* nv2a-port: bumped on any vertex constant write (shaders.c skips copying
+ * 3 KB of constants into the uniform buffer while it is unchanged) */
+uint32_t nv2a_vsh_const_gen = 1;
+/* per constant row: the generation of its last write; all_gen: a write to
+ * rows not tracked one by one (vertex state programs, RDI) */
+uint32_t nv2a_vsh_row_gen[NV2A_VERTEXSHADER_CONSTANTS];
+uint32_t nv2a_vsh_all_gen = 1;
 
 DEF_METHOD_INC(NV097, SET_TRANSFORM_PROGRAM)
 {
@@ -1939,8 +1973,10 @@ DEF_METHOD_INC(NV097, SET_TRANSFORM_CONSTANT)
 
     assert(const_load < NV2A_VERTEXSHADER_CONSTANTS);
     // VertexShaderConstant *constant = &pg->constants[const_load];
-    pg->vsh_constants_dirty[const_load] |=
-        (parameter != pg->vsh_constants[const_load][slot%4]);
+    if (parameter != pg->vsh_constants[const_load][slot%4]) {
+        pg->vsh_constants_dirty[const_load] = true;
+        nv2a_vsh_row_gen[const_load] = ++nv2a_vsh_const_gen;   /* nv2a-port: shaders.c copies on change */
+    }
     pg->vsh_constants[const_load][slot%4] = parameter;
 
     if (slot % 4 == 3) {
@@ -2780,7 +2816,14 @@ DEF_METHOD(NV097, BACK_END_WRITE_SEMAPHORE_RELEASE)
     assert(semaphore_offset < semaphore_dma_len);
     semaphore_data += semaphore_offset;
 
+    { extern bool pgraph_vk_defer_semaphore(NV2AState *d, uint32_t *p, uint32_t v);
+      if (pgraph_vk_defer_semaphore(d, (uint32_t*)semaphore_data, parameter))
+          return; }
     stl_le_p((uint32_t*)semaphore_data, parameter);
+    { extern volatile unsigned s_sem_released_n; extern volatile uint32_t s_last_rel;
+      s_sem_released_n++; s_last_rel = parameter; }
+    { extern void nv2a_tl(int, uint32_t); nv2a_tl(6, parameter); }
+    { extern void nv2a_sem_signal(void); nv2a_sem_signal(); }
 
     //qemu_mutex_lock(&d->pgraph.lock);
     //bql_unlock();
@@ -2918,6 +2961,7 @@ DEF_METHOD(NV097, LAUNCH_TRANSFORM_PROGRAM)
     memcpy(state_linkage.input_regs, pg->vertex_state_shader_v0, sizeof(pg->vertex_state_shader_v0));
 
     nv2a_vsh_emu_execute_track_context_writes(&state, &program, pg->vsh_constants_dirty);
+    nv2a_vsh_all_gen = ++nv2a_vsh_const_gen;   /* nv2a-port: the program may have written any constant */
 
     nv2a_vsh_program_destroy(&program);
 }
