@@ -583,10 +583,15 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  * Only RR. Bit 0 is RPBM, run/pause bus master, which software owns.
  */
 #define AC97_NABM_OFFSET  0x400000u   /* 0xFEC00000 within the MCPX aperture */
-#define AC97_TRAP_BYTES   0x1000u
+#define AC97_TRAP_BYTES   0x3000u   /* NABM block and the second one at +0x2000 */
 #define AC97_RR           0x02u
 
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
+/* POSIX: the registers live here, not on the page, which stays PROT_NONE for
+ * good. Opening the page to emulate one access let another thread's plain
+ * load/store slip past the trap in that window -- a channel reset then read
+ * RR back as set and spun for ever (XMV playback, two audio threads). */
+static char *g_ac97_regs = NULL;
 static void *g_ac97_veh  = NULL;
 static RECOMP_TLS int s_ac97_stepping = 0;
 
@@ -603,8 +608,17 @@ static void ac97_clear_reset_bits(void)
      * whatever channel lives there, and RR is the same bit in all of them. */
     uint32_t off;
 
+    char *base = g_ac97_regs ? g_ac97_regs : (char *)g_ac97_page;
     for (off = 0x10B; off < 0x180; off += 0x10) {
-        volatile uint8_t *r = (volatile uint8_t *)((char *)g_ac97_page + off);
+        volatile uint8_t *r = (volatile uint8_t *)(base + off);
+        if (*r & AC97_RR)
+            *r = (uint8_t)(*r & ~AC97_RR);
+    }
+    /* The MCPX has a second bus-master block 0x2000 above the first (XDK
+     * DirectSound's channel table is {0x10, 0x70, 0x2000, 0x40}); Conker
+     * resets a channel there and spun on it. */
+    for (off = 0x210B; off < 0x2180; off += 0x10) {
+        volatile uint8_t *r = (volatile uint8_t *)(base + off);
         if (*r & AC97_RR)
             *r = (uint8_t)(*r & ~AC97_RR);
     }
@@ -669,13 +683,34 @@ static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
 static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
 {
     uint64_t v = 0;
-    memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
+    int n = size > 8 ? 8 : size, i;
+    memcpy(&v, (char *)dev + off, n);
+    /* Reads are trapped too (the page is PROT_NONE on POSIX): a channel's RR
+     * bit never reads back set. The write trap alone lost a race on arm64 --
+     * Conker's DirectSound read RR as still set right after its reset of the
+     * S/PDIF channel (+0x70) and spun on that single read for ever. */
+    for (i = 0; i < n; i++) {
+        uint32_t a = off + (uint32_t)i;
+        if (((a >= 0x10B && a < 0x180) || (a >= 0x210B && a < 0x2180))
+                && (a & 0xF) == 0xB)
+            v &= ~((uint64_t)AC97_RR << (8 * i));
+    }
     return v;
 }
 
 static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
-    memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
+    int n = size > 8 ? 8 : size, i;
+    /* A channel reset completes instantly: RR is never stored, so no reader
+     * can see it set -- not even one that loads while another thread holds
+     * the page open for its own trap (a plain load then misses the trap). */
+    for (i = 0; i < n; i++) {
+        uint32_t a = off + (uint32_t)i;
+        if (((a >= 0x10B && a < 0x180) || (a >= 0x210B && a < 0x2180))
+                && (a & 0xF) == 0xB)
+            v &= ~((uint64_t)AC97_RR << (8 * i));
+    }
+    memcpy((char *)dev + off, &v, n);
 }
 
 /* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
@@ -704,24 +739,17 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
      * DirectSound's single-threaded init never does. */
     while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
         ;
-    /* Not opened: the emulated store would fault again on this thread,
-     * which holds the lock it would then spin on. Let it be reported. */
-    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE) != 0) {
-        __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
-        return 0;
-    }
 #if defined(__aarch64__)
     ok = mmio_emulate_a64((ucontext_t *)ucv,
                           (uint32_t)(fault - (uintptr_t)g_ac97_page),
-                          g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+                          g_ac97_regs, ac97_posix_rd, ac97_posix_wr);
 #else
     ok = mmio_emulate_x86_64((ucontext_t *)ucv,
                              (uint32_t)(fault - (uintptr_t)g_ac97_page),
-                             g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+                             g_ac97_regs, ac97_posix_rd, ac97_posix_wr);
 #endif
     if (ok)
         ac97_clear_reset_bits();
-    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
     __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
     return ok;
 }
@@ -751,7 +779,10 @@ static void ac97_arm_write_trap(void)
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
         g_ac97_hsize = AC97_TRAP_BYTES;
-    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ) != 0) {
+    g_ac97_regs = (char *)calloc(1, g_ac97_hsize);
+    if (g_ac97_regs)
+        memcpy(g_ac97_regs, g_ac97_page, g_ac97_hsize);   /* codec-ready etc. */
+    if (!g_ac97_regs || mprotect(g_ac97_page, g_ac97_hsize, PROT_NONE) != 0) {
         g_ac97_page = NULL;
         fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
                         " a channel reset will spin\n");
@@ -869,6 +900,10 @@ int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
         return 1;
     if (xbox_OhciOwnsAddress(va))
         return xbox_OhciHandleMmio(ucv, va);
+    {   extern int xbox_NicOwnsAddress(uint32_t), xbox_NicHandleMmio(void *, uint32_t);
+        if (xbox_NicOwnsAddress(va))
+            return xbox_NicHandleMmio(ucv, va);
+    }
 #else
     (void)ucv; (void)fault;
 #endif
@@ -1453,6 +1488,27 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+#if defined(XBOXRECOMP_NV2A_XEMU)
+        /* xemu's NV2A owns the aperture: its registers behave, and every
+         * load here would trap into it. Keep only the MCPX DSP doorbell. */
+        {
+            extern int g_nv2a_xemu_active;
+            if (g_nv2a_xemu_active) {
+                dsp_ack_tick();
+                if (g_mcpx_regs && !g_apu_mmio_trapped) {
+                    for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++)
+                        *(volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]) += 1;
+                }
+                /* KeTickCount still lives here: frozen, every timeout that
+                 * polls it never expires (DirectSound kept resetting its
+                 * AC'97 channels). */
+                *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                       + g_memory_offset) = GetTickCount();
+                Sleep(1);
+                continue;
+            }
+        }
+#endif
         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
          * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
          * which is how the title feels the console's FLIP_STALL. Nothing is
@@ -1702,7 +1758,7 @@ uint32_t g_xbox_code_hi = 0;
 /* Global registers for recompiled code (via recomp_types.h) */
 /* Each guest thread's TIB. The first thread uses the one the loader built;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
-RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN; */
 
 /* The shape of the TLS block the loader built, so a new thread can be
  * given one just like it: where the initialised image data starts, how
@@ -1710,8 +1766,10 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
-RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
-RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0; */
+RECOMP_TLS RecompCpu g_cpu = { .c_fs_base = XBOX_TIB_MAIN, .c_fp_control_word = 0x037Fu,
+    .c_mxcsr = 0x1F80u, .c_fp_cc = 0x4000, .c_eflags = 0x00000202u };
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0; */
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1773,9 +1831,9 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 #endif
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
-RECOMP_TLS uint32_t g_seh_ebp = 0;
-RECOMP_TLS double g_fp_stack[8];
-RECOMP_TLS int g_fp_top = 0;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint32_t g_seh_ebp = 0; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS double g_fp_stack[8]; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS int g_fp_top = 0; */
 
 /* Set once at startup. The generated code reads it at the ret of every
  * --force-return function, so it has to be cheap and it has to default to
@@ -1784,14 +1842,14 @@ RECOMP_TLS int g_fp_top = 0;
 int g_force_return = 0;
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
-RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
-RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
-RECOMP_TLS int g_fp_cmp = 0;
-RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint32_t g_mxcsr = 0x1F80u; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS int g_fp_cmp = 0; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint16_t g_fp_cc = 0x4000; */
 
 /* Defined below, with the other guest registers. */
-extern RECOMP_TLS uint32_t g_ebp;
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi;
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_ebp; */
+#include "recomp_cpu_tls.h" /* was: extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi; */
 
 /* ---- non-local jumps ---------------------------------------------------
  *
@@ -2495,13 +2553,13 @@ void xbox_WatchdogStart(void)
 }
 
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
-RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
-RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3; */
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7; */
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
-RECOMP_TLS uint32_t g_ebp = 0;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint32_t g_ebp = 0; */
 
 /* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
  * ABI's resting state and what almost every one of them does -- so this is
@@ -2510,10 +2568,10 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * `std; repne scasb`, and memmove goes backwards when its regions overlap the
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
-RECOMP_TLS int g_df = 0;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS int g_df = 0; */
 /* EFLAGS: the image pushfd and popfd use (see recomp_types.h). Bit 1 is
  * always set and IF is on, as in any guest thread the kernel schedules. */
-RECOMP_TLS uint32_t g_eflags = 0x00000202u;
+#include "recomp_cpu_tls.h" /* was: RECOMP_TLS uint32_t g_eflags = 0x00000202u; */
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
@@ -4058,6 +4116,12 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * below 16 MB can use the reserve; any other request skips it. */
 #define CONTIG_LOW_RESERVE_START ((15u << 20) / CONTIG_PAGE)
 #define CONTIG_LOW_RESERVE_END   ((16u << 20) / CONTIG_PAGE)
+/* Same for requests that must stay below 8 MB (Conker asks for 4 KB pages
+ * below 0x00800000 all the time; with the D3D heap at 0x1000 none was left
+ * and the call failed ~20,000 times a run). Requests allowed above 8 MB skip
+ * 6..8 MB. */
+#define CONTIG_LOW8_RESERVE_START ((6u << 20) / CONTIG_PAGE)
+#define CONTIG_LOW8_RESERVE_END   ((8u << 20) / CONTIG_PAGE)
 
 /* Physical page 0 is never handed out. The real kernel keeps it, and the
  * XDK's USB stack relies on that: XPP carves its host controller structures
@@ -4197,6 +4261,11 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
                     && p + n > CONTIG_LOW_RESERVE_START) {
                 p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
+                continue;
+            }
+            if (limit > CONTIG_LOW8_RESERVE_END && p < CONTIG_LOW8_RESERVE_END
+                    && p + n > CONTIG_LOW8_RESERVE_START) {
+                p = (CONTIG_LOW8_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
                 continue;
             }
             for (q = p; q < p + n && contig_page_free(q, avoid); q++)
@@ -4390,16 +4459,55 @@ static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
  * order is address order (empty slots keep the address they had), so the
  * search finds the last slot starting at or below `va` and steps back over
  * empty ones. Caller holds g_heap_lock (shared is enough). */
+#define HEAP_AT_HINTS 8
+static volatile int s_heap_at_hint[HEAP_AT_HINTS] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+static volatile unsigned s_heap_at_next;
+static int heap_block_at_search(uint32_t va);
+/* The APU asks about the same few stream blocks at every voice-processor
+ * pass, so recent answers are tried first. A slot that is non-empty and
+ * holds va is the answer whatever moved since: live and free blocks never
+ * overlap. The search below has to step over runs of empty slots, which
+ * after a long session can be thousands long; asked thousands of times a
+ * second under the heap lock, that slowed the guest (the boot movie
+ * stuttered on both phones in 0.22.18). */
 static int heap_block_at(uint32_t va)
 {
+    for (int k = 0; k < HEAP_AT_HINTS; k++) {
+        int h = s_heap_at_hint[k];
+        if (h >= 0 && h < g_heap_block_count && g_heap_blocks[h].size &&
+                va >= g_heap_blocks[h].addr &&
+                (uint64_t)va < (uint64_t)g_heap_blocks[h].addr + g_heap_blocks[h].size)
+            return h;
+    }
+    int h = heap_block_at_search(va);
+    if (h >= 0)
+        s_heap_at_hint[s_heap_at_next++ % HEAP_AT_HINTS] = h;
+    return h;
+}
+
+static int heap_block_at_search(uint32_t va)
+{
+    /* Empty slots (size 0) are not in address order: a merge in
+     * xbox_HeapFree zeroes the slot's address, and a carve moves a block's
+     * start past the empties behind it. Comparing against one sent the search
+     * the wrong way, so after enough frees a live heap block -- Conker's music
+     * stream -- was "not found": its RAM name never stuck, the APU read the
+     * window copy of the same page and played it as full-scale white noise.
+     * Only non-empty blocks take part in the comparison. */
     int lo = 0, hi = g_heap_block_count - 1, at = -1;
     while (lo <= hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (g_heap_blocks[mid].addr <= va) {
-            at = mid;
+        int mid = lo + (hi - lo) / 2, k = mid;
+        while (k >= lo && !g_heap_blocks[k].size)
+            k--;
+        if (k < lo) {           /* lo..mid all empty */
+            lo = mid + 1;
+            continue;
+        }
+        if (g_heap_blocks[k].addr <= va) {
+            at = k;
             lo = mid + 1;
         } else {
-            hi = mid - 1;
+            hi = k - 1;
         }
     }
     for (; at >= 0; at--) {
@@ -4443,6 +4551,19 @@ int xbox_PhysRamNamedAt(uint32_t pa)
     int i, named;
     if (pa >= XBOX_CONTIG_SIZE || !g_phys_ram_named[pa / CONTIG_PAGE])
         return 0;
+    /* The APU asks this for every sample it reads from a named page: try the
+     * recent answers without the lock. The table is a fixed array, so a slot
+     * read while another thread edits it is only stale, never out of bounds,
+     * and a stale answer costs at most one sample of one pass (see the note
+     * on g_phys_ram_named). */
+    for (int k = 0; k < HEAP_AT_HINTS; k++) {
+        int h = s_heap_at_hint[k];
+        if (h >= 0 && h < XBOX_HEAP_MAX_BLOCKS) {
+            uint32_t ba = g_heap_blocks[h].addr, bs = g_heap_blocks[h].size;
+            if (bs && pa >= ba && (uint64_t)pa < (uint64_t)ba + bs)
+                return !g_heap_blocks[h].free && g_heap_blocks[h].named;
+        }
+    }
     AcquireSRWLockShared(&g_heap_lock);
     i = heap_block_at(pa);
     named = i < 0 || (!g_heap_blocks[i].free && g_heap_blocks[i].named);
@@ -4712,4 +4833,26 @@ void xbox_HeapFree(uint32_t xbox_va)
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
+}
+
+/* One line on the guest heap: how much is free and in how big a piece. */
+void xbox_HeapReportState(const char *why)
+{
+    uint64_t free_total = 0, live = 0;
+    uint32_t largest = 0, nfree = 0, nlive = 0;
+    AcquireSRWLockShared(&g_heap_lock);
+    for (int i = 0; i < g_heap_block_count; i++) {
+        if (!g_heap_blocks[i].size) continue;
+        if (g_heap_blocks[i].free) {
+            free_total += g_heap_blocks[i].size; nfree++;
+            if (g_heap_blocks[i].size > largest) largest = g_heap_blocks[i].size;
+        } else { live += g_heap_blocks[i].size; nlive++; }
+    }
+    uint32_t top = g_heap_next ? (uint32_t)(XBOX_HEAP_TOP - g_heap_next) : 0;
+    ReleaseSRWLockShared(&g_heap_lock);
+    fprintf(stderr, "[HEAPSTATE] %s: live %u KB in %u blocks; free %u KB in %u blocks "
+                    "(largest %u KB); untouched top %u KB\n",
+            why, (unsigned)(live / 1024), nlive, (unsigned)(free_total / 1024), nfree,
+            largest / 1024, top / 1024);
+    fflush(stderr);
 }
