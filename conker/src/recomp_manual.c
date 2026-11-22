@@ -428,7 +428,8 @@ void sub_003E2A30(void)
     {   /* the log starts over in each level, so its shots can be found */
         static char lvl[48];
         if (strcmp(lvl, g_xbox_level_name)) { strcpy(lvl, g_xbox_level_name); logged = 0;
-            fprintf(stderr, "[CAM] level %s\n", lvl); }
+            fprintf(stderr, "[CAM] level %s\n", lvl);
+            extern void conker_phys_level_change(void); conker_phys_level_change(); }
     }
     if (logged < 120) {
         static float seen[120];
@@ -775,3 +776,178 @@ void sub_002AF0E0(void)
         xbox_HeapReportState("title malloc failed");
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Physical heap census. The title's 32 MB physical heap (created by
+ * sub_002AF000 with MmAllocateContiguousMemoryEx(0x2070000), object at
+ * [0x84A188]) serves textures, models and level data. When an allocation
+ * from it fails, sub_00063230 calls the out-of-memory handler sub_001F05D0,
+ * which relaunches the title unless D:\dvddata\DontRebootOnException.txt
+ * exists -- the "restart while loading a level" seen after ~20 minutes and
+ * several level changes. Track what is alive in that heap, by caller and
+ * allocation context, and report it at every level change and on failure,
+ * to tell a leak from fragmentation. CONKER_PHYSCENSUS=0 turns it off.
+ * ------------------------------------------------------------------------- */
+#define PC_SLOTS (1 << 17)
+typedef struct { uint32_t ptr, size, ra; char ctx[12]; } PcEnt;
+static PcEnt *s_pc;
+static pthread_mutex_t s_pc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t s_pc_live, s_pc_live_pow2;
+static uint32_t s_pc_count, s_pc_peak_mb;
+static __thread uint32_t t_pc_ra, t_pc_ra2;
+
+static int pc_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("CONKER_PHYSCENSUS"); on = !(e && *e == '0'); }
+    return on;
+}
+static uint32_t pc_pow2(uint32_t n) { uint32_t p = 16; while (p < n && p) p <<= 1; return p ? p : n; }
+static uint32_t pc_hash(uint32_t p) { return (p * 2654435761u) >> 15; }
+
+static void pc_add(uint32_t ptr, uint32_t size, uint32_t ra)
+{
+    if (!s_pc) s_pc = calloc(PC_SLOTS, sizeof(PcEnt));
+    if (!s_pc) return;
+    uint32_t h = pc_hash(ptr) & (PC_SLOTS - 1);
+    for (int i = 0; i < PC_SLOTS; i++, h = (h + 1) & (PC_SLOTS - 1)) {
+        if (s_pc[h].ptr == 0 || s_pc[h].ptr == 1) {
+            s_pc[h].ptr = ptr; s_pc[h].size = size; s_pc[h].ra = ra;
+            for (int k = 0; k < 11; k++) {
+                char c = (char)*(volatile uint8_t *)((uintptr_t)(0x84B680u + k) + g_xbox_mem_offset);
+                s_pc[h].ctx[k] = c; if (!c) break;
+            }
+            s_pc[h].ctx[11] = 0;
+            s_pc_live += size; s_pc_live_pow2 += pc_pow2(size); s_pc_count++;
+            if (s_pc_live_pow2 >> 20 > s_pc_peak_mb) s_pc_peak_mb = (uint32_t)(s_pc_live_pow2 >> 20);
+            return;
+        }
+    }
+}
+static void pc_del(uint32_t ptr)
+{
+    if (!s_pc || !ptr) return;
+    uint32_t h = pc_hash(ptr) & (PC_SLOTS - 1);
+    for (int i = 0; i < PC_SLOTS; i++, h = (h + 1) & (PC_SLOTS - 1)) {
+        if (s_pc[h].ptr == 0) return;
+        if (s_pc[h].ptr == ptr) {
+            s_pc_live -= s_pc[h].size; s_pc_live_pow2 -= pc_pow2(s_pc[h].size); s_pc_count--;
+            s_pc[h].ptr = 1;   /* tombstone */
+            return;
+        }
+    }
+}
+
+typedef struct { uint32_t ra; char ctx[12]; uint64_t bytes; uint32_t n; } PcTop;
+static void pc_report(const char *why)
+{
+    if (!pc_on()) return;
+    pthread_mutex_lock(&s_pc_lock);
+    static PcTop top[512]; int nt = 0;
+    for (int i = 0; s_pc && i < PC_SLOTS; i++) {
+        if (s_pc[i].ptr <= 1) continue;
+        int k;
+        for (k = 0; k < nt; k++)
+            if (top[k].ra == s_pc[i].ra && !strcmp(top[k].ctx, s_pc[i].ctx)) break;
+        if (k == nt) { if (nt == 512) continue; top[nt].ra = s_pc[i].ra; memcpy(top[nt].ctx, s_pc[i].ctx, 12);
+                       top[nt].bytes = 0; top[nt].n = 0; nt++; }
+        top[k].bytes += s_pc[i].size; top[k].n++;
+    }
+    uint32_t outstanding = CONKER_GMEM32(0x7FA4B4);
+    fprintf(stderr, "[PHYSHEAP] %s (%s): %u blocks live, %u KB (%u KB as buddy blocks), peak %u MB; "
+                    "title counters alloc %u free %u live %u\n",
+            why, g_xbox_level_name, s_pc_count, (unsigned)(s_pc_live >> 10),
+            (unsigned)(s_pc_live_pow2 >> 10), s_pc_peak_mb,
+            CONKER_GMEM32(0x7FA494), CONKER_GMEM32(0x7FA490), outstanding);
+    for (int r = 0; r < 12 && nt; r++) {
+        int b = 0;
+        for (int k = 1; k < nt; k++) if (top[k].bytes > top[b].bytes) b = k;
+        if (!top[b].bytes) break;
+        fprintf(stderr, "[PHYSHEAP]   %6u KB in %5u from %08X ctx '%s'\n",
+                (unsigned)(top[b].bytes >> 10), top[b].n, top[b].ra, top[b].ctx);
+        top[b].bytes = 0;
+    }
+    pthread_mutex_unlock(&s_pc_lock);
+}
+
+/* sub_002AF430(size, flags): the title's physical-allocation front end.
+ * Remember who asked, for the heap allocation it makes. */
+extern void sub_002AF430_gen(void);
+extern uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment, uint32_t lo, uint32_t hi);
+extern uint32_t xbox_ContiguousInUseBytes(void);
+static unsigned s_pc_fallbacks;
+void sub_002AF430(void)
+{
+    uint32_t save = t_pc_ra;
+    uint32_t ra = CONKER_GMEM32(g_esp), size = CONKER_GMEM32(g_esp + 4), flags = CONKER_GMEM32(g_esp + 8);
+    t_pc_ra = ra;
+    sub_002AF430_gen();
+    t_pc_ra = save;
+    /* The physical heap is full: take the block from the kernel's contiguous
+     * memory instead, and enter it in the title's own table of direct
+     * contiguous blocks (0x7FA390, 60 slots, used-range count at 0x84A198),
+     * so its free (sub_002AF670) hands it back with MmFreeContiguousMemory.
+     * CONKER_PHYS_FALLBACK=0: the title's behaviour (relaunch). */
+    static int fb = -1;
+    if (fb < 0) { const char *e = getenv("CONKER_PHYS_FALLBACK"); fb = !(e && *e == '0'); }
+    if (g_eax || !fb || !(flags & 0x80000000u) || !size) return;
+    int slot = -1;
+    for (int i = 0; i < 60; i++) if (!CONKER_GMEM32(0x7FA390 + i * 4)) { slot = i; break; }
+    if (slot < 0) { fprintf(stderr, "[PHYSHEAP] fallback: no free slot for %u bytes\n", size); return; }
+    uint32_t va = xbox_ContiguousAllocEx(size, 0x1000, 0, 0x03FFFFFF);
+    s_pc_fallbacks++;
+    fprintf(stderr, "[PHYSHEAP] heap full: %u bytes (%u KB, flags %08X, caller %08X/%08X, level %s) "
+                    "-> contiguous 0x%08X slot %d (#%u; contiguous in use %u KB)\n",
+            size, size / 1024, flags, ra, t_pc_ra2, g_xbox_level_name, va, slot, s_pc_fallbacks,
+            xbox_ContiguousInUseBytes() / 1024);
+    if (!va) return;
+    memset((void *)((uintptr_t)va + g_xbox_mem_offset), 0, size);
+    CONKER_GMEM32(0x7FA390 + slot * 4) = va;
+    uint32_t used = 0;
+    for (int i = 0; i < 60; i++) if (CONKER_GMEM32(0x7FA390 + i * 4)) used = (uint32_t)i + 1;
+    CONKER_GMEM32(0x84A198) = used;
+    g_eax = va;
+}
+/* sub_00063230: resource loader that falls back to the physical heap. */
+extern void sub_00063230_gen(void);
+void sub_00063230(void)
+{
+    uint32_t save = t_pc_ra2;
+    t_pc_ra2 = CONKER_GMEM32(g_esp);
+    sub_00063230_gen();
+    t_pc_ra2 = save;
+}
+/* sub_003E6BD0(heap, size): heap allocation (every heap of the title). */
+extern void sub_003E6BD0_gen(void);
+void sub_003E6BD0(void)
+{
+    uint32_t heap = CONKER_GMEM32(g_esp + 4), size = CONKER_GMEM32(g_esp + 8);
+    sub_003E6BD0_gen();
+    if (!pc_on() || !g_eax || heap != CONKER_GMEM32(0x84A188)) return;
+    pthread_mutex_lock(&s_pc_lock);
+    pc_add(g_eax, size, t_pc_ra2 ? t_pc_ra2 : t_pc_ra);
+    pthread_mutex_unlock(&s_pc_lock);
+}
+/* sub_003E7080(ptr): heap free (the heap is found from the pointer). */
+extern void sub_003E7080_gen(void);
+void sub_003E7080(void)
+{
+    uint32_t ptr = CONKER_GMEM32(g_esp + 4);
+    sub_003E7080_gen();
+    if (!pc_on()) return;
+    pthread_mutex_lock(&s_pc_lock);
+    pc_del(ptr);
+    pthread_mutex_unlock(&s_pc_lock);
+}
+/* sub_001F05D0(size, what): out of physical memory -> relaunch. */
+extern void sub_001F05D0_gen(void);
+void sub_001F05D0(void)
+{
+    uint32_t sz = CONKER_GMEM32(g_esp + 4), what = CONKER_GMEM32(g_esp + 8), ra = CONKER_GMEM32(g_esp);
+    char w[64] = "";
+    for (int i = 0; what && i < 63 && (w[i] = (char)*(volatile uint8_t *)((uintptr_t)(what + i) + g_xbox_mem_offset)); i++) {}
+    fprintf(stderr, "[PHYSHEAP] OUT OF MEMORY: %u bytes (%u KB) for '%s', caller %08X\n", sz, sz / 1024, w, ra);
+    pc_report("allocation failed");
+    sub_001F05D0_gen();
+}
+void conker_phys_level_change(void) { pc_report("level change"); }
