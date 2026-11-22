@@ -11,7 +11,7 @@
   <img alt="Arch" src="https://img.shields.io/badge/arch-arm64--v8a-555">
   <img alt="Graphics" src="https://img.shields.io/badge/graphics-Vulkan-AC162C?logo=vulkan&logoColor=white">
   <img alt="GPUs" src="https://img.shields.io/badge/GPU-Mali%20%C2%B7%20Adreno-0b5fa5">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.22-6a1b9a">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.7.0-6a1b9a">
   <img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange">
 </p>
 
@@ -45,6 +45,16 @@ GPU driver management.
 | 🧩 **GPU drivers** | A built-in Turnip (Mesa) driver is used on Snapdragon devices, with automatic fallback to the system driver; custom driver packages can be installed from the settings. |
 | ⚡ **Performance** | Vulkan commands recorded on a separate thread, asynchronous shader compilation with a persistent cache, pipeline prewarming during loading screens, caches for vertex data and shader parameters, dynamic CPU core selection under thermal throttling. |
 | ⏱️ **Frame rate** | Locked 30 FPS, as on the console. 40 / 60 FPS modes exist as a developer option (parts of the game logic still run too fast above 30). |
+
+## Status
+
+**0.7.0** — the game is playable; tested so far through the opening levels
+(Throne Room, Windmill, training levels). Known issues:
+
+- 40 / 60 FPS modes make parts of the game logic run too fast (hence developer-only).
+- After many level changes the title's 32 MB physical heap can run out; the game then
+  relaunches itself. 0.7.0 serves such allocations from free contiguous memory instead and
+  logs a `[PHYSHEAP]` census at every level change to find what fills the heap.
 
 ## How it works
 
