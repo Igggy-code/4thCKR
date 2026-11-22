@@ -1179,8 +1179,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
-                break;
+            /* No time limit: on a cold first start (empty shader cache,
+             * slow storage) the title starts its USB driver well after 30 s,
+             * and giving up here left the whole session without a
+             * controller. Waiting costs one register read per tick. */
+            if (++waited == 1500)
+                fprintf(stderr, "  [OHCI0] driver not started after 30 s, still waiting\n");
             continue;
         }
         if (!(enable & INTR_MIE))
