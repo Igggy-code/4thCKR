@@ -924,6 +924,24 @@ static void *dump_all_threads(void *arg)
     return NULL;
 }
 
+/* The process log at a freeze, saved to <ext>/dump/hang_<time>.txt: the log
+ * itself does not survive a restart (the next launch, or a test runner,
+ * clears it), so a hang the user meets would otherwise be lost. Also kept:
+ * the previous file of each kind is overwritten only by a newer hang. */
+static volatile int s_in_background;
+static void save_hang_log(const char *kind)
+{
+    if (!s_snap_dir[0] || s_in_background) return;
+    sleep(2);                         /* let the stack dump reach the log */
+    char cmd[1400];
+    time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+    snprintf(cmd, sizeof cmd, "logcat -d --pid=%d > '%s/hang_%s_%02d%02d%02d.txt' 2>&1",
+             (int)getpid(), s_snap_dir, kind, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    int rc = system(cmd);
+    fprintf(stderr, "[HANG] log saved to %s/hang_%s_%02d%02d%02d.txt (rc %d)\n",
+            s_snap_dir, kind, tm.tm_hour, tm.tm_min, tm.tm_sec, rc);
+}
+
 /* hang watchdog: no flip for 6 s -> every thread's stack once, so a freeze
  * the user meets is in the log (REC saves it) */
 static void *hang_watch(void *arg)
@@ -944,6 +962,7 @@ static void *hang_watch(void *arg)
                 fprintf(stderr, "[HANG] the game flips (frame %u) but nothing presented for 3 s (presented %u): stacks follow\n",
                         f, nv2a_presented);
                 dump_all_threads(NULL);
+                save_hang_log("nopresent");
             }
             lf = f;
         }
@@ -952,6 +971,7 @@ static void *hang_watch(void *arg)
             dumped = 1;
             fprintf(stderr, "[HANG] no frame for 6 s (frame %u): stacks follow\n", f);
             dump_all_threads(NULL);
+            save_hang_log("noflip");
         }
     }
     return NULL;
@@ -2043,9 +2063,11 @@ static int android_gpu_main(void)
                 fprintf(stderr, "[BOOT] quit\n");
                 _exit(0);
             case SDL_APP_WILLENTERBACKGROUND:
+                s_in_background = 1;
                 nv2a_host_set_window(NULL);
                 break;
             case SDL_APP_DIDENTERFOREGROUND:
+                s_in_background = 0;
                 nv2a_host_set_window(window_handle(win));
                 break;
             case SDL_WINDOWEVENT:
