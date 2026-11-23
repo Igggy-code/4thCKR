@@ -863,8 +863,11 @@ void pgraph_vk_init_instance(PGRAPHState *pg, Error **errp)
             create_logical_device(pg, errp) && ++step &&
             init_allocator(pg, errp)) {
             PGRAPHVkState *r = pg->vk_renderer_state;
+            /* Qualcomm's own driver reports versions like 512.x; Mesa's
+             * Turnip reports its Mesa version (and may name the GPU
+             * differently, e.g. "Adreno 7c+ Gen 3" for a 642L) */
             if (nv2a_custom_driver_active && r->device_props.vendorID == 0x5143 &&
-                !strstr(r->device_props.deviceName, "Turnip"))
+                VK_VERSION_MAJOR(r->device_props.driverVersion) >= 100)
                 nv2a_driver_status("note: the custom driver was loaded, but the device reports the "
                                    "stock Qualcomm driver (the loader hook fell back)");
             nv2a_driver_status("%s driver: %s, version %u.%u.%u",

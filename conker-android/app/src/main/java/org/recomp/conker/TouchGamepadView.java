@@ -278,7 +278,14 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         @Override public void run() {
             if (sNativeOk) {
                 try { fps = nativeFps(); } catch (UnsatisfiedLinkError e) { fps = -1f; }
-                if (fps > 0 && !firstFrameSeen) { firstFrameSeen = true; if (menuHost != null) menuHost.firstFrame(); }
+                // the first picture on screen: the GPU driver works (nativeFps
+                // has no source in this build and always said -1, so this never
+                // fired and every start with a custom driver looked failed)
+                if (!firstFrameSeen) {
+                    int shown = 0;
+                    try { shown = nativePresented(); } catch (UnsatisfiedLinkError e) { shown = 0; }
+                    if (shown > 0) { firstFrameSeen = true; if (menuHost != null) menuHost.firstFrame(); }
+                }
                 int gs = 0;
                 try { gs = nativeGameState(); } catch (UnsatisfiedLinkError e) { gs = 0; }
                 if (gs != 0 && gameState == 0 && padMode != Settings.PAD_ALWAYS) {
@@ -340,6 +347,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                     updateVisibility();
                 }
                 pollInject();
+                updateVisibility();     // a controller picked up or put down
                 updateAlpha(false);
                 invalidate();
             }
@@ -439,7 +447,21 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     @Override public void onInputDeviceRemoved(int id) { updateVisibility(); }
     @Override public void onInputDeviceChanged(int id) { updateVisibility(); }
 
+    /* A physical controller takes over only once it is actually used, and
+     * the screen takes back over at the first touch. Before, any input
+     * device that called itself a gamepad or joystick turned the touch
+     * controls off for good -- some phones list one that is not a controller
+     * at all (and a paired controller left lying around did the same), and
+     * then nothing on the screen reached the game: no menus, no intro skip,
+     * no play. */
+    static volatile long sPadUsedAt;
+    private static final long PAD_HOLD_MS = 60_000;
+
+    /** A key or stick event from a gamepad / joystick (ConkerActivity). */
+    static void padUsed() { sPadUsedAt = System.currentTimeMillis(); }
+
     private static boolean physicalPadConnected() {
+        if (sPadUsedAt == 0 || System.currentTimeMillis() - sPadUsedAt > PAD_HOLD_MS) return false;
         for (int id : InputDevice.getDeviceIds()) {
             InputDevice d = InputDevice.getDevice(id);
             if (d == null || d.isVirtual()) continue;
@@ -520,6 +542,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             case MotionEvent.ACTION_POINTER_DOWN: {
                 float x = e.getX(idx), y = e.getY(idx);
                 lastTouch = System.currentTimeMillis();
+                if (sPadUsedAt != 0) { sPadUsedAt = 0; updateVisibility(); }   // the screen is in use again
                 if (menuOpen) return true;
                 if (recVisible && recHit(x, y)) { doCapture(); return true; }
                 if (action == MotionEvent.ACTION_DOWN && (x < 18 * dp || x > getWidth() - 18 * dp)) {

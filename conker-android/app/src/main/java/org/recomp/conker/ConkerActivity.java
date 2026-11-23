@@ -88,8 +88,20 @@ public class ConkerActivity extends SDLActivity implements TouchGamepadView.Menu
         if (panel != null) panel.toggle();
     }
 
+    private static boolean fromPad(int source) {
+        return (source & android.view.InputDevice.SOURCE_GAMEPAD) == android.view.InputDevice.SOURCE_GAMEPAD
+            || (source & android.view.InputDevice.SOURCE_JOYSTICK) == android.view.InputDevice.SOURCE_JOYSTICK;
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(android.view.MotionEvent event) {
+        if (fromPad(event.getSource())) TouchGamepadView.padUsed();
+        return super.dispatchGenericMotionEvent(event);
+    }
+
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (fromPad(event.getSource()) && event.getKeyCode() != KeyEvent.KEYCODE_BACK) TouchGamepadView.padUsed();
         // Back (the system button / gesture, not a gamepad's B) opens the menu.
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && panel != null
                 && (event.getSource() & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD) {

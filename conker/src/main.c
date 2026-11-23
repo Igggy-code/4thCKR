@@ -971,7 +971,7 @@ static void *hang_watch(void *arg)
             dumped = 1;
             fprintf(stderr, "[HANG] no frame for 6 s (frame %u): stacks follow\n", f);
             dump_all_threads(NULL);
-            save_hang_log("noflip");
+            if (f > 1) save_hang_log("noflip");   /* frame 1: still the boot black screen */
         }
     }
     return NULL;
