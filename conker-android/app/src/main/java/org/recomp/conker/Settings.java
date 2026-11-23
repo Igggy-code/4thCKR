@@ -156,7 +156,10 @@ final class Settings {
         if (DRIVER_SYSTEM.equals(d)) return null;
         if (d.startsWith(CUSTOM_PREFIX)) return libIn(new File(new File(gpuDir(), "custom"), d.substring(CUSTOM_PREFIX.length())));
         // auto: the built-in Turnip on Snapdragon, unless it failed before
-        if (!isSnapdragon() || builtinFailed()) return null;
+        // files/nv2a_test_turnip (a test switch): the built-in driver on any GPU,
+        // to exercise the loader hooks on a phone without Adreno
+        boolean test = new File(ctx.getExternalFilesDir(null), "nv2a_test_turnip").exists();
+        if ((!isSnapdragon() && !test) || (builtinFailed() && !test)) return null;
         return ensureBuiltin();
     }
 
