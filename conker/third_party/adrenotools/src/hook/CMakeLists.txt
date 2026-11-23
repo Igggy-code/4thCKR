@@ -25,3 +25,10 @@ target_compile_options(gsl_alloc_hook PRIVATE -Wall -Wextra)
 target_link_options(gsl_alloc_hook PRIVATE -z global)
 target_link_libraries(gsl_alloc_hook hook_impl)
 set_target_properties(gsl_alloc_hook PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
+# 4thCKR: the hooks are built with the static C++ runtime (the app ships no
+# libc++_shared.so); keep its symbols out of the hooks' dynamic tables so they
+# cannot interpose on the vendor driver's libc++ in the loader namespace.
+foreach(t hook_impl main_hook file_redirect_hook gsl_alloc_hook)
+    target_link_options(${t} PRIVATE "-Wl,--exclude-libs,ALL")
+endforeach()
