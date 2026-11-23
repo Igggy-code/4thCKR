@@ -221,9 +221,9 @@ static PFN_vkGetInstanceProcAddr load_adreno_driver(void)
                                          hooks, dir, name, NULL, NULL);
     if (!h) {
         extern void nv2a_driver_status(const char *fmt, ...);
-        const char *de = dlerror();
-        nv2a_driver_status("custom driver %s did not load (adrenotools: %s): using the system driver",
-                           name, de ? de : "no detail");
+        extern char adrenotools_fail_step[256];
+        nv2a_driver_status("custom driver %s did not load (%s): using the system driver",
+                           name, adrenotools_fail_step[0] ? adrenotools_fail_step : "no detail");
         return NULL;
     }
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
@@ -863,6 +863,10 @@ void pgraph_vk_init_instance(PGRAPHState *pg, Error **errp)
             create_logical_device(pg, errp) && ++step &&
             init_allocator(pg, errp)) {
             PGRAPHVkState *r = pg->vk_renderer_state;
+            if (nv2a_custom_driver_active && r->device_props.vendorID == 0x5143 &&
+                !strstr(r->device_props.deviceName, "Turnip"))
+                nv2a_driver_status("note: the custom driver was loaded, but the device reports the "
+                                   "stock Qualcomm driver (the loader hook fell back)");
             nv2a_driver_status("%s driver: %s, version %u.%u.%u",
                 nv2a_custom_driver_active ? "custom" : "system",
                 r->device_props.deviceName,

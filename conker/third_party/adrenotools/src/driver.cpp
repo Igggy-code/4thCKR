@@ -2,6 +2,7 @@
 // Copyright © 2021 Billy Laws
 
 #include <string>
+#include <cstdio>
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -16,10 +17,19 @@
 #include <adrenotools/driver.h>
 #include <unistd.h>
 
+// 4thCKR: why the last adrenotools_open_libvulkan returned nullptr
+extern "C" char adrenotools_fail_step[256];
+char adrenotools_fail_step[256];
+#define FAIL(what) do { const char *de_ = dlerror(); \
+    snprintf(adrenotools_fail_step, sizeof adrenotools_fail_step, "%s%s%s", what, de_ ? ": " : "", de_ ? de_ : ""); \
+    __android_log_print(ANDROID_LOG_ERROR, "adrenotools", "%s", adrenotools_fail_step); \
+    return nullptr; } while (0)
+
 void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *tmpLibDir, const char *hookLibDir, const char *customDriverDir, const char *customDriverName, const char *fileRedirectDir, void **userMappingHandle) {
     // Bail out if linkernsbypass failed to load, this probably means we're on api < 28
+    adrenotools_fail_step[0] = 0;
     if (!linkernsbypass_load_status())
-        return nullptr;
+        FAIL("linker namespace bypass unavailable");
 
     // Always use memfd on Q+ since it's guaranteed to work
     if (android_get_device_api_level() >= 29)
@@ -43,7 +53,7 @@ void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *
             return nullptr;
 
         if (stat((std::string(customDriverDir) + customDriverName).c_str(), &buf) != 0)
-            return nullptr;
+            FAIL("driver file not found");
     }
 
     // Verify that params for enabled features are correct
@@ -59,18 +69,20 @@ void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *
     auto hookNs{android_create_namespace("adrenotools-libvulkan", hookLibDir, nullptr, ANDROID_NAMESPACE_TYPE_SHARED, nullptr, nullptr)};
 
     // Link it to the default namespace so the hook can use libandroid etc
+    if (!hookNs)
+        FAIL("cannot create the hook namespace");
     if (!linkernsbypass_link_namespace_to_default_all_libs(hookNs))
-        return nullptr;
+        FAIL("cannot link the hook namespace");
 
     // Preload the hook implementation, otherwise we get a weird issue where despite being in NEEDED of the hook lib the hook's symbols will overwrite ours and cause an infinite loop
     auto hookImpl{linkernsbypass_namespace_dlopen("libhook_impl.so", RTLD_NOW, hookNs)};
     if (!hookImpl)
-        return nullptr;
+        FAIL("cannot load libhook_impl.so");
 
     // Pass parameters to the hook implementation
     auto initHookParam{reinterpret_cast<void (*)(const void *)>(dlsym(hookImpl, "init_hook_param"))};
     if (!initHookParam)
-        return nullptr;
+        FAIL("libhook_impl.so has no init_hook_param");
 
 
     auto importMapping{[&]() -> adrenotools_gpu_mapping * {
@@ -88,9 +100,12 @@ void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *
 
     // Load the libvulkan hook into the isolated namespace
     if (!linkernsbypass_namespace_dlopen("libmain_hook.so", RTLD_GLOBAL, hookNs))
-        return nullptr;
+        FAIL("cannot load libmain_hook.so");
 
-    return linkernsbypass_namespace_dlopen_unique("/system/lib64/libvulkan.so", tmpLibDir, dlopenFlags, hookNs);
+    void *vk = linkernsbypass_namespace_dlopen_unique("/system/lib64/libvulkan.so", tmpLibDir, dlopenFlags, hookNs);
+    if (!vk)
+        FAIL("cannot load the hooked libvulkan.so");
+    return vk;
 }
 
 bool adrenotools_import_user_mem(void *handle, void *hostPtr, uint64_t size) {

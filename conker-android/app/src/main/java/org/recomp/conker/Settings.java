@@ -249,11 +249,11 @@ final class Settings {
 
     private File statusFile() { return new File(gpuDir(), "driver_status.txt"); }
 
-    /** What the native side said about the driver at the last start. */
+    /** What the native side said about the driver at the last start (all lines). */
     String lastDriverStatus() {
         try {
             List<String> ls = java.nio.file.Files.readAllLines(statusFile().toPath());
-            return ls.isEmpty() ? "" : ls.get(ls.size() - 1);
+            return String.join("; ", ls);
         } catch (Exception e) { return ""; }
     }
 
