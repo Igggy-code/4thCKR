@@ -17,6 +17,8 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <sched.h>
+#include <time.h>
 #include "renderer.h"
 
 void pgraph_vk_init_reports(PGRAPHState *pg)
@@ -172,12 +174,45 @@ static void process_reports(NV2AState *d, VkQueryPool pool, int *nq_io,
         size_t size_of_results = nq * sizeof(uint64_t);
         query_results = g_malloc_n(nq, sizeof(uint64_t)); // FIXME: Pre-allocate
         VkResult result;
-        do {
+        /* nv2a-port: bounded. A query that was never recorded or submitted
+         * never becomes available, and Mali answers NOT_READY to a WAIT
+         * read of it at once, every time: the pfifo thread spun here
+         * forever with the picture frozen (Pixel 6, 0.7.14). The frame's
+         * fence has signalled by now, so whatever is still unavailable
+         * after a short while never will be: such a query counts as
+         * visible (an object drawn rather than wrongly hidden). */
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
             result = vkGetQueryPoolResults(
                 r->device, pool, 0, nq,
                 size_of_results, query_results, sizeof(uint64_t),
                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        } while (result == VK_NOT_READY);
+            if (result != VK_NOT_READY) break;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 > 100) break;
+            sched_yield();
+        }
+        if (result != VK_SUCCESS) {
+            uint64_t *av = g_malloc_n((size_t)nq * 2, sizeof(uint64_t));
+            VkResult r2 = vkGetQueryPoolResults(
+                r->device, pool, 0, nq, (size_t)nq * 2 * sizeof(uint64_t), av,
+                2 * sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            int missing = 0;
+            for (int i = 0; i < nq; i++) {
+                bool ok = (r2 == VK_SUCCESS || r2 == VK_NOT_READY) && av[i * 2 + 1];
+                query_results[i] = ok ? av[i * 2] : 4096ull * pg->surface_scale_factor *
+                                                    pg->surface_scale_factor;
+                missing += !ok;
+            }
+            g_free(av);
+            static unsigned nlog;
+            if (nlog++ < 20)
+                fprintf(stderr, "[REPORT] %d of %d visibility queries never became "
+                                "available (result %d): counted as visible\n",
+                        missing, nq, (int)result);
+        }
     }
 
     // Write out queries
