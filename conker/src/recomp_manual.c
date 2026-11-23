@@ -951,3 +951,17 @@ void sub_001F05D0(void)
     sub_001F05D0_gen();
 }
 void conker_phys_level_change(void) { pc_report("level change"); }
+
+/* Where the title's 32 MB physical heap (MmAllocateContiguousMemoryEx of
+ * 0x2070000) landed. The menu textures the touch overlay recognises are
+ * known by their address inside it as captured with the heap at 0x01A00000
+ * (nv2a draw.c); contiguous memory from the top put the heap at 0x01570000,
+ * the menus went unrecognised and the swipe hints never showed. */
+void xbox_contig_alloc_hook(uint32_t size, uint32_t va)
+{
+    if (size != 0x2070000u) return;
+    extern volatile int32_t nv2a_menu_tex_shift;
+    nv2a_menu_tex_shift = (int32_t)((va - 0x80000000u) - 0x01A00000u);
+    fprintf(stderr, "[PHYSHEAP] heap at 0x%08X (menu texture addresses shifted by %+d KB)\n",
+            va, nv2a_menu_tex_shift / 1024);
+}

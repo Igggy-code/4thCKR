@@ -4240,6 +4240,9 @@ static int contig_page_free(uint32_t q, int avoid_image)
  * block its heap could not serve on a second visit to a level: the title
  * relaunched. From the top, the big blocks sit together at the top and the
  * free memory stays in one run at the bottom, as on the console. */
+/* game glue: told of every block handed out (where a title's heap landed) */
+__attribute__((weak)) void xbox_contig_alloc_hook(uint32_t size, uint32_t va) { (void)size; (void)va; }
+
 static uint32_t contig_topdown_pages(void)
 {
     static int mb = -1;
@@ -4352,6 +4355,7 @@ static uint32_t contig_alloc(uint32_t size, uint32_t alignment,
     }
 done:
     if (result) {
+        /* told outside the lock (below) */
         g_contig_allocs++;
         contig_report("alloc", result, n);
     } else {
@@ -4373,6 +4377,7 @@ done:
     if (result)
         memset((void *)((uintptr_t)result + g_memory_offset), 0,
                (size_t)n * CONTIG_PAGE);
+    if (result) xbox_contig_alloc_hook(size, result);
     return result;
 }
 

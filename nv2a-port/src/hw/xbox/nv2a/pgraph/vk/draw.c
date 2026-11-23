@@ -89,6 +89,8 @@ static float s_aimq_bb[4]; static bool s_aimq_valid, s_aimq_known;
 /* the front-end main menu's panel (512x203, format 0x19; the bar cutscene
  * before it doesn't draw it): the touch overlay's swipe hints wait for it */
 volatile int64_t nv2a_frontmenu_seen_ms;
+/* how far Conker's physical heap sits from 0x01A00000 (conker glue) */
+volatile int32_t nv2a_menu_tex_shift;
 double nv2a_pipe_sync_ms; unsigned nv2a_pipe_sync_n;
 static void nv2a_note_draw(PGRAPHState *pg, unsigned count, const char *kind)
 {
@@ -109,7 +111,11 @@ static void nv2a_note_draw(PGRAPHState *pg, unsigned count, const char *kind)
         PGRAPHVkState *r = pg->vk_renderer_state;
         TextureBinding *t0 = r->texture_bindings[0];
         if (t0 && t0 != &r->dummy_texture) {
-            uint32_t a = (uint32_t)t0->key.texture_vram_offset;
+            /* the addresses are where the textures sat with the title's
+             * physical heap at 0x01A00000; the heap is placed elsewhere now
+             * (contiguous memory from the top), so they move with it */
+            extern volatile int32_t nv2a_menu_tex_shift;
+            uint32_t a = (uint32_t)t0->key.texture_vram_offset - (uint32_t)nv2a_menu_tex_shift;
             unsigned w = t0->key.state.width, h = t0->key.state.height;
             int k = (a == 0x02528700 && w == 64 && h == 512) ? 0 :
                     (a == 0x027b1380 && w == 512 && h == 128) ? 1 :
