@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // Copyright © 2021 Billy Laws
 
+#include <cstring>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,11 @@ struct android_namespace_t *android_create_namespace(const char *name,
                                                      uint64_t type,
                                                      const char *permitted_when_isolated_path,
                                                      android_namespace_t *parent_namespace) {
+    /* conker: resolve on first use here too: libhook_impl.so links its own
+     * copy of this file and calls this without ever calling load_status, so
+     * with the resolver no longer a constructor it jumped to a null pointer
+     * inside the Vulkan loader (the custom driver "crashed"). */
+    if (!linkernsbypass_load_status()) return nullptr;
     auto caller{__builtin_return_address(0)};
     return loader_android_create_namespace(name, ld_library_path, default_library_path, type,
                                            permitted_when_isolated_path, parent_namespace, caller);
@@ -46,6 +52,7 @@ struct android_namespace_t *android_create_namespace_escape(const char *name,
                                                             uint64_t type,
                                                             const char *permitted_when_isolated_path,
                                                             android_namespace_t *parent_namespace) {
+    if (!linkernsbypass_load_status()) return nullptr;
     auto caller{reinterpret_cast<void *>(&dlopen)};
     return loader_android_create_namespace(name, ld_library_path, default_library_path, type,
                                            permitted_when_isolated_path, parent_namespace, caller);
@@ -58,6 +65,7 @@ android_link_namespaces_all_libs_t android_link_namespaces_all_libs;
 android_link_namespaces_t android_link_namespaces;
 
 bool linkernsbypass_link_namespace_to_default_all_libs(android_namespace_t *to) {
+    if (!linkernsbypass_load_status() || !to) return false;
     // Creating a shared namespace with the default parent will give a copy of the default namespace that we can actually access
     // This is needed since there is no way to access a direct handle to the default namespace as it's not exported
     static auto defaultNs{android_create_namespace_escape("default_copy", nullptr, nullptr, ANDROID_NAMESPACE_TYPE_SHARED, nullptr, nullptr)};
@@ -165,23 +173,45 @@ static void resolve_linker_symbols() {
         while (!blInstr->Verify() && n < 32) { blInstr++; n++; }
         if (n >= 32) return static_cast<loader_dlopen_t>(nullptr);
         auto target{reinterpret_cast<loader_dlopen_t>(blInstr + blInstr->offset)};
-        /* the target must be a symbol the dynamic linker exports */
+        /* The target must be the linker's __loader_dlopen: either the
+         * exported symbol itself, or (Android 12-14: libdl's dlopen calls it
+         * through the PLT) a PLT stub inside libdl -- adrp x16; ldr x17;
+         * add x16; br x17. The first check alone rejected the PLT form and
+         * left every custom GPU driver unloadable on those versions. */
         Dl_info di{};
-        if (!dladdr(reinterpret_cast<void *>(target), &di) || !di.dli_sname ||
-            reinterpret_cast<void *>(target) != di.dli_saddr)
+        if (!dladdr(reinterpret_cast<void *>(target), &di))
             return static_cast<loader_dlopen_t>(nullptr);
-        return target;
+        if (di.dli_sname && reinterpret_cast<void *>(target) == di.dli_saddr)
+            return target;
+        const uint32_t *ins = reinterpret_cast<const uint32_t *>(target);
+        if (ins[0] == 0xD503245Fu) ins++;                     /* bti c (BTI-enabled PLT) */
+        bool in_libdl = di.dli_fname && strstr(di.dli_fname, "libdl");
+        bool plt = (ins[0] & 0x9F00001Fu) == 0x90000010u &&   /* adrp x16, ... */
+                   (ins[1] & 0xFFC003FFu) == 0xF9400211u &&   /* ldr x17, [x16, #...] */
+                   (ins[2] & 0xFFC003FFu) == 0x91000210u &&   /* add x16, x16, #... */
+                   ins[3] == 0xD61F0220u;                     /* br x17 */
+        __android_log_print(ANDROID_LOG_INFO, "linkernsbypass",
+                            "dlopen walk: %d insns, target %p in %s (%s), plt %d",
+                            n, reinterpret_cast<void *>(target), di.dli_fname ? di.dli_fname : "?",
+                            di.dli_sname ? di.dli_sname : "no symbol", plt ? 1 : 0);
+        if (in_libdl && plt)
+            return target;
+        return static_cast<loader_dlopen_t>(nullptr);
     }()};
 
-    if (!loader_dlopen)
+    if (!loader_dlopen) {
+        __android_log_print(ANDROID_LOG_ERROR, "linkernsbypass", "__loader_dlopen not found");
         return;
+    }
     // Protect the loader_dlopen function to remove the BTI attribute (since this is an internal function that isn't intended to be jumped indirectly to)
     mprotect(align_ptr(reinterpret_cast<void *>(&loader_dlopen)), getpagesize(), PROT_WRITE | PROT_READ | PROT_EXEC);
 
     // Passing dlopen as a caller address tricks the linker into using the internal unrestricted namespace letting us access libraries that are normally forbidden in the classloader namespace imposed on apps
     auto ldHandle{loader_dlopen("ld-android.so", RTLD_LAZY, reinterpret_cast<void *>(&dlopen))};
-    if (!ldHandle)
+    if (!ldHandle) {
+        __android_log_print(ANDROID_LOG_ERROR, "linkernsbypass", "ld-android.so not opened");
         return;
+    }
 
     android_link_namespaces_all_libs = reinterpret_cast<android_link_namespaces_all_libs_t>(dlsym(ldHandle, "__loader_android_link_namespaces_all_libs"));
     if (!android_link_namespaces_all_libs)

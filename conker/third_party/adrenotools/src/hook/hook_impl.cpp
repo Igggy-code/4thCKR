@@ -43,6 +43,9 @@ __attribute__((visibility("default"))) void *hook_android_dlopen_ext(const char 
 
     LOGI("hook_android_dlopen_ext: filename: %s", filename);
 
+    if (!linkernsbypass_load_status())
+        return fallback();
+
     // Ignore non-vulkan libraries
     if (!strstr(filename, "vulkan."))
         return android_dlopen_ext(filename, flags, extinfo);
@@ -141,6 +144,12 @@ __attribute__((visibility("default"))) void *hook_android_dlopen_ext(const char 
 
 __attribute__((visibility("default"))) void *hook_android_load_sphal_library(const char *filename, int flags) {
     LOGI("hook_android_load_sphal_library: filename: %s", filename);
+
+    // 4thCKR: this copy of linkernsbypass resolves the linker on first use
+    if (!linkernsbypass_load_status() || !android_get_exported_namespace) {
+        LOGI("hook_android_load_sphal_library: linker bypass unavailable, plain dlopen");
+        return dlopen(filename, flags);
+    }
 
     // https://android.googlesource.com/platform/system/core/+/master/libvndksupport/linker.cpp
     for (const char *name : {"sphal", "vendor", "default"}) {
