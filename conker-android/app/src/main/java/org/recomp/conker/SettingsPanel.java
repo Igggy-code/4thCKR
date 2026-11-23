@@ -191,7 +191,9 @@ final class SettingsPanel extends FrameLayout {
         section("GPU driver");
         boolean active = false;
         try { active = TouchGamepadView.nativeDriverActive() != 0; } catch (Throwable ignored) { }
+        String ds = st.lastDriverStatus();
         body.addView(note("In use: " + (active ? "custom driver" : "system driver")
+                + (ds.isEmpty() ? "" : " (" + ds + ")")
                 + ". A change takes effect after a restart."));
         RadioGroup d = group();
         List<String> custom = st.customDrivers();
@@ -232,6 +234,13 @@ final class SettingsPanel extends FrameLayout {
         bottom.addView(restartBtn);
         body.addView(bottom);
         if (st.recVisible()) body.addView(note("REC button on (tap the title 3 times to hide)."));
+
+        // logs for a bug report: one zip in Download
+        Button logs = button("Save logs for a bug report", v -> saveLogs());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, (int) (14 * dp), 0, 0);
+        body.addView(logs, lp);
 
         // disc image: a one-off, so one small line at the very bottom
         LinearLayout disc = new LinearLayout(act);
@@ -319,6 +328,71 @@ final class SettingsPanel extends FrameLayout {
             final String m = msg;
             act.runOnUiThread(() -> Toast.makeText(act, m, Toast.LENGTH_LONG).show());
         }).start();
+    }
+
+    /** Device, settings, driver status, this run's log, the previous run's
+     *  log and any freeze logs, zipped into Download/4thCKR_logs_<time>.zip. */
+    private void saveLogs() {
+        Toast.makeText(act, "Collecting logs…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String msg;
+            try {
+                String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                        .format(new java.util.Date());
+                String name = "4thCKR_logs_" + stamp + ".zip";
+                android.content.ContentValues cv = new android.content.ContentValues();
+                cv.put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name);
+                cv.put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/zip");
+                android.net.Uri uri = act.getContentResolver().insert(
+                        android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                if (uri == null) throw new Exception("cannot create the file in Download");
+                try (java.util.zip.ZipOutputStream z = new java.util.zip.ZipOutputStream(
+                        act.getContentResolver().openOutputStream(uri))) {
+                    StringBuilder info = new StringBuilder();
+                    info.append("app ").append(version()).append('\n')
+                        .append("device ").append(android.os.Build.MANUFACTURER).append(' ')
+                        .append(android.os.Build.MODEL).append(" (").append(android.os.Build.DEVICE).append(")\n")
+                        .append("soc ").append(Settings.socName()).append('\n')
+                        .append("android ").append(android.os.Build.VERSION.RELEASE)
+                        .append(" (API ").append(android.os.Build.VERSION.SDK_INT).append(")\n")
+                        .append("driver setting ").append(st.driver()).append('\n')
+                        .append("driver status ").append(st.lastDriverStatus()).append('\n');
+                    try { info.append("driver in use ").append(TouchGamepadView.nativeDriverActive() != 0 ? "custom" : "system").append('\n'); }
+                    catch (Throwable ignored) { }
+                    zipText(z, "info.txt", info.toString());
+                    Process pr = Runtime.getRuntime().exec(new String[] { "logcat", "-d", "-v", "time" });
+                    z.putNextEntry(new java.util.zip.ZipEntry("this_session.txt"));
+                    try (java.io.InputStream in = pr.getInputStream()) { copy(in, z); }
+                    z.closeEntry();
+                    java.io.File dump = new java.io.File(act.getExternalFilesDir(null), "dump");
+                    java.io.File[] fs = dump.listFiles();
+                    if (fs != null) for (java.io.File f : fs) {
+                        String n = f.getName();
+                        if (!(n.equals("prev_session.txt") || n.startsWith("hang_") || n.equals("inputs.txt"))) continue;
+                        z.putNextEntry(new java.util.zip.ZipEntry(n));
+                        try (java.io.InputStream in = new java.io.FileInputStream(f)) { copy(in, z); }
+                        z.closeEntry();
+                    }
+                }
+                msg = "Logs saved: Download/" + name;
+            } catch (Exception e) {
+                msg = "Logs not saved: " + e.getMessage();
+            }
+            final String m = msg;
+            act.runOnUiThread(() -> Toast.makeText(act, m, Toast.LENGTH_LONG).show());
+        }).start();
+    }
+
+    private static void zipText(java.util.zip.ZipOutputStream z, String name, String text) throws java.io.IOException {
+        z.putNextEntry(new java.util.zip.ZipEntry(name));
+        z.write(text.getBytes("UTF-8"));
+        z.closeEntry();
+    }
+
+    private static void copy(java.io.InputStream in, java.io.OutputStream out) throws java.io.IOException {
+        byte[] buf = new byte[1 << 16];
+        int k;
+        while ((k = in.read(buf)) > 0) out.write(buf, 0, k);
     }
 
     private void restart() {

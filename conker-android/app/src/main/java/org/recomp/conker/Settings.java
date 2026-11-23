@@ -134,8 +134,18 @@ final class Settings {
     }
 
     private static File libIn(File dir) {
+        File meta = new File(dir, "meta.json");
+        if (meta.isFile()) {
+            try {
+                org.json.JSONObject j = new org.json.JSONObject(new String(
+                        java.nio.file.Files.readAllBytes(meta.toPath()), "UTF-8"));
+                String n = j.optString("libraryName", "");
+                if (!n.isEmpty() && new File(dir, n).isFile()) return new File(dir, n);
+            } catch (Exception e) { Log.w(TAG, "driver meta.json", e); }
+        }
         File[] fs = dir.listFiles();
         if (fs == null) return null;
+        java.util.Arrays.sort(fs);
         for (File f : fs) if (f.getName().endsWith(".so")) return f;
         return null;
     }
@@ -162,26 +172,52 @@ final class Settings {
         }
     }
 
-    /** Unpacks a driver package (.zip with a .so, or a bare .so) into dir. */
+    /** Unpacks a driver package (.zip with a .so, or a bare .so) into dir.
+     *  The package is copied first and read through its central directory
+     *  (ZipFile): ZipInputStream refuses some archives emulator drivers come
+     *  in (stored entries with data descriptors). */
     static File unpack(InputStream in, File dir) throws Exception {
         dir.mkdirs();
-        File lib = null;
-        try (ZipInputStream z = new ZipInputStream(in)) {
-            ZipEntry e;
+        File tmp = new File(dir, ".incoming");
+        try (OutputStream o = new FileOutputStream(tmp)) {
             byte[] buf = new byte[1 << 16];
-            while ((e = z.getNextEntry()) != null) {
-                String n = new File(e.getName()).getName();
-                if (e.isDirectory() || n.isEmpty() || !(n.endsWith(".so") || n.endsWith(".json"))) continue;
-                File f = new File(dir, n);
-                try (OutputStream o = new FileOutputStream(f)) {
-                    int k;
-                    while ((k = z.read(buf)) > 0) o.write(buf, 0, k);
-                }
-                if (n.endsWith(".so")) { f.setReadable(true, true); lib = f; }
-            }
+            int k;
+            while ((k = in.read(buf)) > 0) o.write(buf, 0, k);
         }
-        if (lib == null) throw new Exception("no driver library (.so) in the package");
-        return lib;
+        try {
+            byte[] head = new byte[4];
+            try (InputStream h = new java.io.FileInputStream(tmp)) { h.read(head); }
+            if (head[0] == 0x7f && head[1] == 'E' && head[2] == 'L' && head[3] == 'F') {
+                File lib = new File(dir, "vulkan.custom.so");
+                if (!tmp.renameTo(lib)) throw new Exception("cannot store the driver");
+                lib.setReadable(true, true);
+                return lib;
+            }
+            if (head[0] != 'P' || head[1] != 'K')
+                throw new Exception("not a driver package (.zip with a .so inside, or a .so)");
+            File lib = null;
+            try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(tmp)) {
+                java.util.Enumeration<? extends ZipEntry> en = z.entries();
+                byte[] buf = new byte[1 << 16];
+                while (en.hasMoreElements()) {
+                    ZipEntry e = en.nextElement();
+                    String n = new File(e.getName()).getName();
+                    if (e.isDirectory() || n.isEmpty() || !(n.endsWith(".so") || n.endsWith(".json"))) continue;
+                    File f = new File(dir, n);
+                    try (InputStream zi = z.getInputStream(e); OutputStream o = new FileOutputStream(f)) {
+                        int k;
+                        while ((k = zi.read(buf)) > 0) o.write(buf, 0, k);
+                    }
+                    if (n.endsWith(".so")) { f.setReadable(true, true); if (lib == null) lib = f; }
+                }
+            }
+            File named = libIn(dir);
+            if (named != null) lib = named;
+            if (lib == null) throw new Exception("no driver library (.so) in the package");
+            return lib;
+        } finally {
+            tmp.delete();
+        }
     }
 
     /** Installs a user package; returns its id ("custom:<name>"). */
@@ -211,17 +247,42 @@ final class Settings {
         f.delete();
     }
 
-    /** A start with a custom driver that never reached a frame: back to the
-     *  system driver. Returns a message for the user, or null. */
+    private File statusFile() { return new File(gpuDir(), "driver_status.txt"); }
+
+    /** What the native side said about the driver at the last start. */
+    String lastDriverStatus() {
+        try {
+            List<String> ls = java.nio.file.Files.readAllLines(statusFile().toPath());
+            return ls.isEmpty() ? "" : ls.get(ls.size() - 1);
+        } catch (Exception e) { return ""; }
+    }
+
+    /** A start with a custom driver that never reached a frame (it crashed or
+     *  hung): back to the system driver. Returns a message, or null. The
+     *  marker holds the process id: a second onCreate in the same process
+     *  (the activity recreated) is not a failed start. */
     String checkLastStart() {
+        int ver = 0;
+        try { ver = (int) ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).getLongVersionCode(); }
+        catch (Exception ignored) { }
+        if (p.getInt("builtin_failed_ver", -1) != ver) {
+            // a new version tries the built-in driver again
+            p.edit().putBoolean("builtin_failed", false).putInt("builtin_failed_ver", ver).apply();
+        }
         File pf = pendingFile();
         if (!pf.exists()) return null;
         String what = "";
         try { what = new String(java.nio.file.Files.readAllBytes(pf.toPath())).trim(); } catch (Exception ignored) { }
+        String[] parts = what.split(" ");
+        if (parts.length > 1 && parts[1].equals(String.valueOf(android.os.Process.myPid()))) return null;
         pf.delete();
-        if (what.startsWith(BUILTIN_ID)) p.edit().putBoolean("builtin_failed", true).apply();
+        String id = parts[0];
+        String reason = lastDriverStatus();
+        Log.w(TAG, "driver " + id + " did not reach a frame; last status: " + reason);
+        if (id.startsWith(BUILTIN_ID)) p.edit().putBoolean("builtin_failed", true).apply();
         else setDriver(DRIVER_SYSTEM);
-        return "The GPU driver did not start last time - switched to the system driver.";
+        return "The GPU driver " + id + " did not start last time - switched to the system driver."
+                + (reason.isEmpty() ? "" : "\n" + reason);
     }
 
     /** The first frame is on screen: the driver works. */
@@ -239,13 +300,15 @@ final class Settings {
             File ov = languageOverlay(language());
             if (ov != null) setenv("CONKER_OVERLAY", ov.getAbsolutePath());
         }
+        statusFile().delete();
+        setenv("NV2A_DRIVER_STATUS", statusFile().getAbsolutePath());
         File drv = effectiveDriver();
         if (drv != null) {
             setenv("NV2A_ADRENO_DRIVER_DIR", drv.getParentFile().getAbsolutePath() + "/");
             setenv("NV2A_ADRENO_DRIVER_NAME", drv.getName());
             setenv("NV2A_ADRENO_HOOK_DIR", nativeLibDir + "/");
             try (FileOutputStream o = new FileOutputStream(pendingFile())) {
-                o.write(drv.getParentFile().getName().getBytes());
+                o.write((drv.getParentFile().getName() + " " + android.os.Process.myPid()).getBytes());
             } catch (Exception ignored) { }
         }
         Log.i(TAG, "scale x" + scale() + ", 4:3 " + aspect43() + ", driver " + (drv != null ? drv : "system"));
