@@ -56,6 +56,9 @@ static uint8_t s_configuration[USB_GAMEPAD_MAX];
 
 uint8_t usb_gamepad_address(int pad) { return s_address[pad & 3]; }
 int usb_gamepad_configured(int pad) { return s_configuration[pad & 3] != 0; }
+/* unplugged: the next plug enumerates from address 0 again */
+static int s_replugged;
+void usb_gamepad_reset(int pad) { s_address[pad & 3] = 0; s_configuration[pad & 3] = 0; s_replugged = 1; }
 
 /* ---- control transfers ------------------------------------------------- */
 
@@ -110,9 +113,14 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
             s_address[pad & 3] = (uint8_t)(setup->wValue & 0x7F);
             return 0;                    /* zero-length status stage */
 
-        case REQ_SET_CONFIGURATION:
+        case REQ_SET_CONFIGURATION: {
+            /* test switch USB_TEST_FAIL_FIRST: configuration fails until
+             * the pad has been unplugged once, as a starved enumeration
+             * that never finishes (the re-plug test) */
+            if (!s_replugged && getenv("USB_TEST_FAIL_FIRST")) return -1;
             s_configuration[pad & 3] = (uint8_t)(setup->wValue & 0xFF);
             return 0;
+        }
 
         case REQ_GET_CONFIGURATION:
             if (!is_in || max < 1) return -1;

@@ -6,6 +6,7 @@
  * plus a trace of every register access, because what the driver does after
  * that decides how the rest gets built.
  */
+#include <time.h>
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../platform/mmio_decode_a64.h"
@@ -1212,6 +1213,39 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
                             "arriving on port %u\n", waited * 20, port + 1);
             fflush(stderr);
+        }
+
+        /* An enumeration that never finished: the title's USB stack gives
+         * up on a transfer that is late, and on a busy first start (shaders
+         * compiled on every core, this thread starved) it can be late
+         * enough. The pad then never reaches SET_CONFIGURATION and the
+         * whole session has no controller -- no touch, no intro skip. Unplug
+         * it and plug it in again, as a player would, until it is
+         * configured. */
+        if (plugged && !usb_gamepad_configured(0)) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+            static uint64_t plug_ms, unplug_ms;
+            static unsigned replugs;
+            uint32_t *ps = &hc->reg[(HcRhPortStatus1 + first_port * 4) / 4];
+            if (!plug_ms) plug_ms = now;
+            if (!unplug_ms && now - plug_ms > 8000u * (replugs < 3 ? replugs + 1 : 4)) {
+                *ps &= ~(PORT_CCS | PORT_PES);
+                *ps |= PORT_CSC;
+                __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], INTR_RHSC, __ATOMIC_SEQ_CST);
+                usb_gamepad_reset(0);
+                unplug_ms = now;
+                fprintf(stderr, "  [OHCI0] controller not configured in time: unplugged (retry %u)\n",
+                        ++replugs);
+                fflush(stderr);
+            } else if (unplug_ms && now - unplug_ms > 1000) {
+                *ps |= PORT_CCS | PORT_CSC;
+                __atomic_or_fetch(&hc->reg[HcInterruptStatus / 4], INTR_RHSC, __ATOMIC_SEQ_CST);
+                unplug_ms = 0;
+                plug_ms = now;
+                fprintf(stderr, "  [OHCI0] controller plugged in again on port %u\n", first_port + 1);
+                fflush(stderr);
+            }
         }
 
         /* More pads, one at a time: each arrives after the previous one is
