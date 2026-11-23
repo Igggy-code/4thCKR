@@ -430,6 +430,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             sInputLog = new java.io.File(d, "inputs.txt");
             sInputLog.delete();
         }
+        Log.i(TAG, "input devices:\n" + describeInputDevices());
         inputManager = (InputManager) getContext().getSystemService(Context.INPUT_SERVICE);
         if (inputManager != null) inputManager.registerInputDeviceListener(this, handler);
         updateVisibility();
@@ -459,6 +460,22 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
     /** A key or stick event from a gamepad / joystick (ConkerActivity). */
     static void padUsed() { sPadUsedAt = System.currentTimeMillis(); }
+
+    /** Every input device with its sources, for bug reports (which ones
+     *  call themselves a gamepad or joystick). */
+    static String describeInputDevices() {
+        StringBuilder sb = new StringBuilder();
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d == null) continue;
+            int s = d.getSources();
+            boolean pad = (s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                    || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+            sb.append(d.getName()).append(" [sources 0x").append(Integer.toHexString(s))
+              .append(d.isVirtual() ? ", virtual" : "").append(pad ? ", GAMEPAD" : "").append("]\n");
+        }
+        return sb.toString();
+    }
 
     private static boolean physicalPadConnected() {
         if (sPadUsedAt == 0 || System.currentTimeMillis() - sPadUsedAt > PAD_HOLD_MS) return false;
@@ -543,6 +560,9 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 float x = e.getX(idx), y = e.getY(idx);
                 lastTouch = System.currentTimeMillis();
                 if (sPadUsedAt != 0) { sPadUsedAt = 0; updateVisibility(); }   // the screen is in use again
+                // controls hidden with the toggle: a touch brings them back
+                // (nothing else did, and menus ignored touches while hidden)
+                if (userHidden) { userHidden = false; updateVisibility(); }
                 if (menuOpen) return true;
                 if (recVisible && recHit(x, y)) { doCapture(); return true; }
                 if (action == MotionEvent.ACTION_DOWN && (x < 18 * dp || x > getWidth() - 18 * dp)) {

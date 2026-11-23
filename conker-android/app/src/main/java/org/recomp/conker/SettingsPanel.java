@@ -359,6 +359,7 @@ final class SettingsPanel extends FrameLayout {
                         .append("driver status ").append(st.lastDriverStatus()).append('\n');
                     try { info.append("driver in use ").append(TouchGamepadView.nativeDriverActive() != 0 ? "custom" : "system").append('\n'); }
                     catch (Throwable ignored) { }
+                    info.append("input devices:\n").append(TouchGamepadView.describeInputDevices());
                     zipText(z, "info.txt", info.toString());
                     Process pr = Runtime.getRuntime().exec(new String[] { "logcat", "-d", "-v", "time" });
                     z.putNextEntry(new java.util.zip.ZipEntry("this_session.txt"));
