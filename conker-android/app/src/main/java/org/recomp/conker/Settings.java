@@ -104,7 +104,7 @@ final class Settings {
     boolean recVisible() { return p.getBoolean("rec_visible", false); }
     void setRecVisible(boolean b) { p.edit().putBoolean("rec_visible", b).apply(); }
     String driver() { return p.getString("gpu_driver", DRIVER_AUTO); }
-    void setDriver(String d) { p.edit().putString("gpu_driver", d).apply(); }
+    void setDriver(String d) { p.edit().putString("gpu_driver", d).putString("driver_failed_id", "").apply(); }
     boolean builtinFailed() { return p.getBoolean("builtin_failed", false); }
 
     // ---- GPU ------------------------------------------------------------------------------
@@ -266,8 +266,19 @@ final class Settings {
         try { ver = (int) ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).getLongVersionCode(); }
         catch (Exception ignored) { }
         if (p.getInt("builtin_failed_ver", -1) != ver) {
-            // a new version tries the built-in driver again
-            p.edit().putBoolean("builtin_failed", false).putInt("builtin_failed_ver", ver).apply();
+            // A new version tries again the driver an earlier start gave up
+            // on: the built-in Turnip, and a custom driver the fallback had
+            // replaced with "System". Versions before 0.7.4 switched to
+            // System without remembering why (and their Turnip could never
+            // load), so that one setting goes back to Auto once.
+            SharedPreferences.Editor e = p.edit()
+                    .putBoolean("builtin_failed", false).putInt("builtin_failed_ver", ver);
+            String failed = p.getString("driver_failed_id", "");
+            if (DRIVER_SYSTEM.equals(driver())) {
+                if (!failed.isEmpty()) e.putString("gpu_driver", failed);
+                else if (!p.getBoolean("migrated_074", false)) e.putString("gpu_driver", DRIVER_AUTO);
+            }
+            e.putString("driver_failed_id", "").putBoolean("migrated_074", true).apply();
         }
         File pf = pendingFile();
         if (!pf.exists()) return null;
@@ -280,7 +291,7 @@ final class Settings {
         String reason = lastDriverStatus();
         Log.w(TAG, "driver " + id + " did not reach a frame; last status: " + reason);
         if (id.startsWith(BUILTIN_ID)) p.edit().putBoolean("builtin_failed", true).apply();
-        else setDriver(DRIVER_SYSTEM);
+        else p.edit().putString("driver_failed_id", driver()).putString("gpu_driver", DRIVER_SYSTEM).apply();
         return "The GPU driver " + id + " did not start last time - switched to the system driver."
                 + (reason.isEmpty() ? "" : "\n" + reason);
     }
