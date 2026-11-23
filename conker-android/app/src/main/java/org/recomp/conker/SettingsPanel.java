@@ -369,7 +369,7 @@ final class SettingsPanel extends FrameLayout {
                     java.io.File[] fs = dump.listFiles();
                     if (fs != null) for (java.io.File f : fs) {
                         String n = f.getName();
-                        if (!(n.equals("prev_session.txt") || n.startsWith("hang_") || n.equals("inputs.txt"))) continue;
+                        if (!(n.equals("prev_session.txt") || n.startsWith("hang_") || n.equals("inputs.txt") || n.equals("exits.txt") || n.startsWith("tombstone_") || n.startsWith("anr_") || n.startsWith("relaunch_"))) continue;
                         z.putNextEntry(new java.util.zip.ZipEntry(n));
                         try (java.io.InputStream in = new java.io.FileInputStream(f)) { copy(in, z); }
                         z.closeEntry();

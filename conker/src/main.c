@@ -2361,6 +2361,9 @@ int main(int argc, char **argv)
      * space; without the extended-VMA tracker its free-region scan never
      * ends. D3D's Present waits on vblank interrupts. */
     set_default_env("RECOMP_EXT_VMA", "1");
+    /* big contiguous blocks from the top, as the console kernel places them:
+     * keeps the free memory in one run for a big level block (xbox_memory_layout.c) */
+    set_default_env("RECOMP_CONTIG_TOPDOWN_MB", "4");
     set_default_env("RECOMP_VBLANK", "1");   /* sw path only; xemu set it 0 */
 
     fprintf(stderr, "=== Conker: Live and Reloaded — static recompilation ===\n");
@@ -2421,6 +2424,8 @@ void xbox_title_exit_hook(unsigned routine)
     { int n = 0; _Unwind_Backtrace(exit_bt_cb, &n); }
     { extern void xbox_HeapReportState(const char *why); xbox_HeapReportState("title relaunch"); }
     fflush(stderr);
+    /* the restarted game (or a test runner) clears the log: keep this one */
+    save_hang_log(relaunch ? "relaunch" : "quit");
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     jobject act = (jobject)SDL_AndroidGetActivity();
     if (env && act) {

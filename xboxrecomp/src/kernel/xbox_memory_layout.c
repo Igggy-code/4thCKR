@@ -4231,8 +4231,46 @@ static int contig_page_free(uint32_t q, int avoid_image)
              && q < (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE);
 }
 
+/* Large blocks from the top (RECOMP_CONTIG_TOPDOWN_MB=<n>: blocks of n MB
+ * and more). The console kernel hands out contiguous memory from the top;
+ * this arena fills from the bottom, and the low reserves below push a big
+ * early block up to 16 MB. Conker's 10 MB D3D block landed at 16..26 MB and
+ * its 32 MB physical heap right after it, which left the free memory in two
+ * pieces (0..16 MB and 58..64 MB), neither big enough for the 19 MB level
+ * block its heap could not serve on a second visit to a level: the title
+ * relaunched. From the top, the big blocks sit together at the top and the
+ * free memory stays in one run at the bottom, as on the console. */
+static uint32_t contig_topdown_pages(void)
+{
+    static int mb = -1;
+    if (mb < 0) {
+        const char *e = getenv("RECOMP_CONTIG_TOPDOWN_MB");
+        mb = e ? atoi(e) : 0;
+        if (mb < 0) mb = 0;
+    }
+    return mb ? (uint32_t)mb * (1u << 20) / CONTIG_PAGE : 0;
+}
+
+/* A request that may also take the low reserves' pages (still free ones
+ * only): a last resort, for a block that fits nowhere else. */
+static uint32_t contig_alloc(uint32_t size, uint32_t alignment,
+                             uint32_t phys_lo, uint32_t phys_hi, int use_reserves);
+
+uint32_t xbox_ContiguousAllocLastResort(uint32_t size, uint32_t alignment,
+                                        uint32_t phys_lo, uint32_t phys_hi)
+{
+    uint32_t r = contig_alloc(size, alignment, phys_lo, phys_hi, 0);
+    return r ? r : contig_alloc(size, alignment, phys_lo, phys_hi, 1);
+}
+
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi)
+{
+    return contig_alloc(size, alignment, phys_lo, phys_hi, 0);
+}
+
+static uint32_t contig_alloc(uint32_t size, uint32_t alignment,
+                             uint32_t phys_lo, uint32_t phys_hi, int use_reserves)
 {
     uint32_t n, align_pages, lo_page, limit, p, q, pass, result = 0;
 
@@ -4253,17 +4291,49 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
 
     contig_lock();
     if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
+    {   /* large: highest place that fits (see contig_topdown_pages) */
+        uint32_t td = contig_topdown_pages();
+        int skip_res = !use_reserves && limit > CONTIG_LOW_RESERVE_END;
+        int skip_res8 = !use_reserves && limit > CONTIG_LOW8_RESERVE_END;
+        if (td && n >= td && limit >= n && limit - n >= lo_page) {
+            for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
+                int avoid = pass == 0;
+                int64_t pp = (int64_t)((limit - n) & ~(align_pages - 1));
+                while (pp >= (int64_t)lo_page) {
+                    p = (uint32_t)pp;
+                    if (skip_res && p < CONTIG_LOW_RESERVE_END && p + n > CONTIG_LOW_RESERVE_START) {
+                        pp = ((int64_t)CONTIG_LOW_RESERVE_START - n) & ~(int64_t)(align_pages - 1);
+                        continue;
+                    }
+                    if (skip_res8 && p < CONTIG_LOW8_RESERVE_END && p + n > CONTIG_LOW8_RESERVE_START) {
+                        pp = ((int64_t)CONTIG_LOW8_RESERVE_START - n) & ~(int64_t)(align_pages - 1);
+                        continue;
+                    }
+                    /* the highest page in the run that is taken */
+                    for (q = p + n; q > p && contig_page_free(q - 1, avoid); q--)
+                        ;
+                    if (q == p) {
+                        contig_take(p, n);
+                        result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                        break;
+                    }
+                    pp = ((int64_t)(q - 1) - n) & ~(int64_t)(align_pages - 1);
+                }
+            }
+            goto done;
+        }
+    }
     for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
         int avoid = pass == 0;
         p = (lo_page + align_pages - 1) & ~(align_pages - 1);
         while ((uint64_t)p + n <= limit) {
             /* A request free to go above 16 MB steps over the low reserve. */
-            if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
+            if (!use_reserves && limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
                     && p + n > CONTIG_LOW_RESERVE_START) {
                 p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
                 continue;
             }
-            if (limit > CONTIG_LOW8_RESERVE_END && p < CONTIG_LOW8_RESERVE_END
+            if (!use_reserves && limit > CONTIG_LOW8_RESERVE_END && p < CONTIG_LOW8_RESERVE_END
                     && p + n > CONTIG_LOW8_RESERVE_START) {
                 p = (CONTIG_LOW8_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
                 continue;
@@ -4280,6 +4350,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             p = (q + align_pages - 1) & ~(align_pages - 1);
         }
     }
+done:
     if (result) {
         g_contig_allocs++;
         contig_report("alloc", result, n);

@@ -43,7 +43,45 @@ public class ConkerActivity extends SDLActivity implements TouchGamepadView.Menu
                         if (!l.contains(self) && !l.contains(self2)) out.println(l);
                 }
             } catch (Exception e) { android.util.Log.e("ConkerActivity", "prev session", e); }
+            saveExitReasons(dir);
         }).start();
+    }
+
+    /** Why the game's earlier processes ended (crash, low memory, the title
+     *  relaunching itself...), as the system keeps it: survives a cleared
+     *  log. dump/exits.txt; a native crash's tombstone as dump/tombstone_<time>.pb. */
+    private void saveExitReasons(java.io.File dir) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            java.util.List<android.app.ApplicationExitInfo> l = am.getHistoricalProcessExitReasons(null, 0, 16);
+            java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US);
+            StringBuilder sb = new StringBuilder();
+            for (android.app.ApplicationExitInfo x : l) {
+                String line = f.format(new java.util.Date(x.getTimestamp())) + " pid " + x.getPid()
+                        + " " + x.getProcessName() + " reason " + x.getReason() + " status " + x.getStatus()
+                        + " importance " + x.getImportance() + " pss " + x.getPss() / 1024 + " MB rss "
+                        + x.getRss() / 1024 + " MB: " + x.getDescription();
+                sb.append(line).append('\n');
+                android.util.Log.i("ConkerExit", line);
+                if (x.getReason() == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE
+                        || x.getReason() == android.app.ApplicationExitInfo.REASON_ANR) {
+                    java.io.File t = new java.io.File(dir, (x.getReason() == android.app.ApplicationExitInfo.REASON_ANR
+                            ? "anr_" : "tombstone_") + x.getTimestamp() + ".pb");
+                    if (t.exists()) continue;
+                    try (java.io.InputStream in = x.getTraceInputStream()) {
+                        if (in == null) continue;
+                        try (java.io.FileOutputStream out = new java.io.FileOutputStream(t)) {
+                            byte[] b = new byte[65536]; int n;
+                            while ((n = in.read(b)) > 0) out.write(b, 0, n);
+                        }
+                    }
+                }
+            }
+            try (java.io.PrintWriter out = new java.io.PrintWriter(new java.io.File(dir, "exits.txt"))) {
+                out.print(sb);
+            }
+        } catch (Exception e) { android.util.Log.e("ConkerActivity", "exit reasons", e); }
     }
 
     @Override

@@ -873,7 +873,7 @@ static void pc_report(const char *why)
 /* sub_002AF430(size, flags): the title's physical-allocation front end.
  * Remember who asked, for the heap allocation it makes. */
 extern void sub_002AF430_gen(void);
-extern uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment, uint32_t lo, uint32_t hi);
+extern uint32_t xbox_ContiguousAllocLastResort(uint32_t size, uint32_t alignment, uint32_t lo, uint32_t hi);
 extern uint32_t xbox_ContiguousInUseBytes(void);
 static unsigned s_pc_fallbacks;
 void sub_002AF430(void)
@@ -894,7 +894,7 @@ void sub_002AF430(void)
     int slot = -1;
     for (int i = 0; i < 60; i++) if (!CONKER_GMEM32(0x7FA390 + i * 4)) { slot = i; break; }
     if (slot < 0) { fprintf(stderr, "[PHYSHEAP] fallback: no free slot for %u bytes\n", size); return; }
-    uint32_t va = xbox_ContiguousAllocEx(size, 0x1000, 0, 0x03FFFFFF);
+    uint32_t va = xbox_ContiguousAllocLastResort(size, 0x1000, 0, 0x03FFFFFF);
     s_pc_fallbacks++;
     fprintf(stderr, "[PHYSHEAP] heap full: %u bytes (%u KB, flags %08X, caller %08X/%08X, level %s) "
                     "-> contiguous 0x%08X slot %d (#%u; contiguous in use %u KB)\n",

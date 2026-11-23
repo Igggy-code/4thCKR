@@ -430,7 +430,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             sInputLog = new java.io.File(d, "inputs.txt");
             sInputLog.delete();
         }
-        Log.i(TAG, "input devices:\n" + describeInputDevices());
+        sOldPadCheck = ext != null && new java.io.File(ext, "nv2a_old_padcheck").exists();
+        Log.i(TAG, "input devices" + (sOldPadCheck ? " (old pad check)" : "") + ":\n" + describeInputDevices());
         inputManager = (InputManager) getContext().getSystemService(Context.INPUT_SERVICE);
         if (inputManager != null) inputManager.registerInputDeviceListener(this, handler);
         updateVisibility();
@@ -477,8 +478,12 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         return sb.toString();
     }
 
+    /** test switch files/nv2a_old_padcheck: the old rule (any connected
+     *  gamepad turns touch off), to reproduce it */
+    static boolean sOldPadCheck;
+
     private static boolean physicalPadConnected() {
-        if (sPadUsedAt == 0 || System.currentTimeMillis() - sPadUsedAt > PAD_HOLD_MS) return false;
+        if (!sOldPadCheck && (sPadUsedAt == 0 || System.currentTimeMillis() - sPadUsedAt > PAD_HOLD_MS)) return false;
         for (int id : InputDevice.getDeviceIds()) {
             InputDevice d = InputDevice.getDevice(id);
             if (d == null || d.isVirtual()) continue;

@@ -197,6 +197,9 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 /* The same, constrained to physical addresses [phys_lo, phys_hi] (inclusive),
  * as MmAllocateContiguousMemoryEx asks. Alignment is rounded up to a page and
  * to a power of two. */
+/* xbox_ContiguousAllocEx, then the same allowed into the low reserves */
+uint32_t xbox_ContiguousAllocLastResort(uint32_t size, uint32_t alignment,
+                                        uint32_t phys_lo, uint32_t phys_hi);
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi);
 /* Record a block the caller placed itself, so it is not handed out again. */
