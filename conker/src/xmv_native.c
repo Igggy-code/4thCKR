@@ -113,6 +113,7 @@ typedef struct {
     struct SwsContext *sws; int sws_w, sws_h, sws_fmt;
     uint8_t *swz; size_t swz_cap;
     unsigned frames_out, frames_dropped;
+    int skippable, skip_armed;          /* see skip_pressed() */
 } XmvPlayer;
 
 static XmvPlayer s_pl[2];
@@ -408,6 +409,11 @@ static uint32_t player_open(const char *host_path)
         avformat_close_input(&p->fmt);
         return 0;
     }
+    {   char lc[512]; int i = 0;
+        for (; host_path[i] && i < 511; i++) lc[i] = (char)((host_path[i] >= 'A' && host_path[i] <= 'Z') ? host_path[i] + 32 : host_path[i]);
+        lc[i] = 0;
+        p->skippable = strstr(lc, "bootintro") || strstr(lc, "attract") || strstr(lc, "/brief");
+    }
     p->ring = calloc(AR_FRAMES, 4);
     pthread_mutex_init(&p->mu, NULL);
     pthread_cond_init(&p->cv, NULL);
@@ -493,6 +499,28 @@ static void write_surface(XmvPlayer *p, uint32_t surf, AVFrame *f)
 }
 
 /* XMVRESULT: 0 no frame yet, 1 new frame, 2 end of file, 3 failure */
+/* The boot intro, the attract loop and the multiplayer briefings can be
+ * skipped with A or START (a tap in gesture mode is A): the title's own
+ * skip did not react with the native player, and the intro is long.
+ * A press counts only once every button was up after the movie started
+ * (a held button from the menu does not skip the next movie). */
+#include "../../xboxrecomp/src/input/xinput_xbox.h"
+extern DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
+static int skip_pressed(XmvPlayer *p)
+{
+    if (!p->skippable || now_s() - p->wall0 < 0.5) return 0;
+    int down = 0;
+    for (DWORD port = 0; port < 4; port++) {
+        XBOX_INPUT_STATE st;
+        memset(&st, 0, sizeof st);
+        if (xbox_InputGetState(port, &st) != 0) continue;
+        if (st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] > 30 || (st.Gamepad.wButtons & 0x0010u /* START */))
+            down = 1;
+    }
+    if (!down) { p->skip_armed = 1; return 0; }
+    return p->skip_armed;
+}
+
 static uint32_t next_frame(XmvPlayer *p, uint32_t surf, double *pts_out)
 {
     /* the first frame: wait for the decoder (the title spins on it anyway) */
@@ -519,6 +547,10 @@ static uint32_t next_frame(XmvPlayer *p, uint32_t surf, double *pts_out)
         p->started = 1;                 /* sound and clock start with frame 0 */
         p->frames_out++;
         return 1;
+    }
+    if (skip_pressed(p)) {
+        fprintf(stderr, "[XMV] skipped by the player after %.1f s\n", now_s() - p->wall0);
+        return 2;
     }
     double c = clock_s(p);
     pthread_mutex_lock(&p->mu);
