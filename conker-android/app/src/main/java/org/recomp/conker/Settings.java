@@ -292,15 +292,24 @@ final class Settings {
         pf.delete();
         String id = parts[0];
         String reason = lastDriverStatus();
-        Log.w(TAG, "driver " + id + " did not reach a frame; last status: " + reason);
+        // One start without a frame is not enough to drop a driver: the
+        // first start with a new driver builds its shader cache behind a
+        // black screen, and closing the app then is no crash. Two in a row is.
+        int misses = p.getInt("driver_misses", 0) + 1;
+        Log.w(TAG, "driver " + id + " did not reach a frame (" + misses + " in a row); last status: " + reason);
+        if (misses < 2) {
+            p.edit().putInt("driver_misses", misses).apply();
+            return null;
+        }
+        p.edit().putInt("driver_misses", 0).apply();
         if (id.startsWith(BUILTIN_ID)) p.edit().putBoolean("builtin_failed", true).apply();
         else p.edit().putString("driver_failed_id", driver()).putString("gpu_driver", DRIVER_SYSTEM).apply();
-        return "The GPU driver " + id + " did not start last time - switched to the system driver."
+        return "The GPU driver " + id + " did not start twice in a row - switched to the system driver."
                 + (reason.isEmpty() ? "" : "\n" + reason);
     }
 
     /** The first frame is on screen: the driver works. */
-    void markStarted() { pendingFile().delete(); }
+    void markStarted() { pendingFile().delete(); p.edit().putInt("driver_misses", 0).apply(); }
 
     /** Environment for libmain, set before it starts. */
     void apply(String nativeLibDir) {
