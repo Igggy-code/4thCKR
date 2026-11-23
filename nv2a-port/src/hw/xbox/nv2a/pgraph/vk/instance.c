@@ -168,6 +168,7 @@ add_optional_instance_extension_names(PGRAPHState *pg,
  * negotiate the ICD interface, then its vk_icdGetInstanceProcAddr stands in
  * for vkGetInstanceProcAddr. Any failure falls back to the system driver. */
 #include <dlfcn.h>
+#include <stdarg.h>
 static PFN_vkGetInstanceProcAddr load_custom_driver(void)
 {
     const char *path = getenv("NV2A_VK_DRIVER");
@@ -219,7 +220,10 @@ static PFN_vkGetInstanceProcAddr load_adreno_driver(void)
     void *h = adrenotools_open_libvulkan(RTLD_NOW, 1 /* ADRENOTOOLS_DRIVER_CUSTOM */, NULL,
                                          hooks, dir, name, NULL, NULL);
     if (!h) {
-        fprintf(stderr, "[vk] adrenotools: %s%s did not load, system driver\n", dir, name);
+        extern void nv2a_driver_status(const char *fmt, ...);
+        const char *de = dlerror();
+        nv2a_driver_status("custom driver %s did not load (adrenotools: %s): using the system driver",
+                           name, de ? de : "no detail");
         return NULL;
     }
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
@@ -601,7 +605,10 @@ static bool select_physical_device(PGRAPHState *pg, Error **errp)
          * triangle-depth shaders (DEVICE_LOST after ~8 s). Draw without them:
          * quads become indexed triangles, depth comes from the vertex. */
         const char *e = getenv("NV2A_VK_GS");
-        r->no_geometry_shader = e ? (*e == '0') : (r->device_props.vendorID == 0x13B5);
+        /* On Android the GS-free path everywhere: it is the one tested on
+         * phones (Mali), and Adreno's own driver mis-draws xemu's
+         * geometry shaders too. NV2A_VK_GS=1 brings them back. */
+        r->no_geometry_shader = e ? (*e == '0') : NV2A_MOBILE_PATH(r);
         fprintf(stderr, "[vk] geometry shaders %s\n",
                 r->no_geometry_shader ? "off (GS-free path)" : "on");
     }
@@ -828,16 +835,57 @@ static bool init_allocator(PGRAPHState *pg, Error **errp)
     return true;
 }
 
+/* nv2a-port: one line about the driver in use, for the app (it shows the
+ * reason when a custom driver is dropped) -- NV2A_DRIVER_STATUS names the
+ * file. */
+void nv2a_driver_status(const char *fmt, ...)
+{
+    const char *path = getenv("NV2A_DRIVER_STATUS");
+    va_list ap;
+    va_start(ap, fmt);
+    char line[512];
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "[vk] driver status: %s\n", line);
+    if (!path || !*path) return;
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "%s\n", line);
+    fclose(f);
+}
+
 void pgraph_vk_init_instance(PGRAPHState *pg, Error **errp)
 {
-    if (create_instance(pg, errp) &&
-        select_physical_device(pg, errp) &&
-        create_logical_device(pg, errp) &&
-        init_allocator(pg, errp)) {
-        return;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int step = 0;
+        if (create_instance(pg, errp) && ++step &&
+            select_physical_device(pg, errp) && ++step &&
+            create_logical_device(pg, errp) && ++step &&
+            init_allocator(pg, errp)) {
+            PGRAPHVkState *r = pg->vk_renderer_state;
+            nv2a_driver_status("%s driver: %s, version %u.%u.%u",
+                nv2a_custom_driver_active ? "custom" : "system",
+                r->device_props.deviceName,
+                VK_VERSION_MAJOR(r->device_props.driverVersion),
+                VK_VERSION_MINOR(r->device_props.driverVersion),
+                VK_VERSION_PATCH(r->device_props.driverVersion));
+            return;
+        }
+        static const char *what[] = { "creating the instance", "finding a suitable GPU",
+                                      "creating the device (a required feature is missing)",
+                                      "creating the memory allocator" };
+        pgraph_vk_finalize_instance(pg);
+        if (!nv2a_custom_driver_active) {
+            nv2a_driver_status("system driver failed while %s", what[step]);
+            break;
+        }
+        /* the custom driver cannot run the renderer: the system driver,
+         * in this same start, instead of a crash a few lines later */
+        nv2a_driver_status("custom driver failed while %s: using the system driver", what[step]);
+        unsetenv("NV2A_ADRENO_DRIVER_DIR");
+        unsetenv("NV2A_VK_DRIVER");
+        nv2a_custom_driver_active = 0;
     }
-
-    pgraph_vk_finalize_instance(pg);
 
     const char *msg = "Failed to initialize Vulkan renderer";
     if (*errp) {

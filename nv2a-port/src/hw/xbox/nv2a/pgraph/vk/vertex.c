@@ -356,7 +356,7 @@ void pgraph_vk_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
          * stretched world geometry. NV2A_NO_W1=1 turns this off. */
         static int mali_w1 = -1;
         if (mali_w1 < 0)
-            mali_w1 = r->device_props.vendorID == 0x13B5 && !getenv("NV2A_NO_W1");
+            mali_w1 = NV2A_MOBILE_PATH(r) && !getenv("NV2A_NO_W1");
         {   /* NV2A_AB_W1: A/B test, w1 on for 5 s, off for 5 s */
             static int ab = -1;
             if (ab < 0) ab = getenv("NV2A_AB_W1") != NULL;

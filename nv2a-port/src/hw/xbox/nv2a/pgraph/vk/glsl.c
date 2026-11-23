@@ -263,7 +263,7 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(PGRAPHVkState *r,
     size_t len = strlen(glsl_source);
     uint64_t key = fast_hash((const uint8_t *)glsl_source, len);
     key ^= ((uint64_t)stage << 56) ^ ((uint64_t)r->vk_api_version << 8)
-         ^ ((uint64_t)(r->device_props.vendorID == 0x13B5) << 4) ^ SPV_CACHE_VERSION;
+         ^ ((uint64_t)(NV2A_MOBILE_PATH(r) ? 1 : 0) << 4) ^ SPV_CACHE_VERSION;
     key ^= (uint64_t)len * 0x9E3779B97F4A7C15ull;
     char path[1200];
     snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)key);
@@ -316,7 +316,7 @@ static GByteArray *compile_glsl_to_spv_uncached(PGRAPHVkState *r,
      * OpDemoteToHelperInvocation, a capability xemu never enables on the
      * device (validation: VUID-VkShaderModuleCreateInfo-pCode-08740). Mali
      * gets SPIR-V 1.5, where discard stays OpKill. */
-    if (r->device_props.vendorID == 0x13B5 && r->vk_api_version >= VK_API_VERSION_1_2) {
+    if (NV2A_MOBILE_PATH(r) && r->vk_api_version >= VK_API_VERSION_1_2) {
         client_version = GLSLANG_TARGET_VULKAN_1_2;
         target_spv = GLSLANG_TARGET_SPV_1_5;
     } else

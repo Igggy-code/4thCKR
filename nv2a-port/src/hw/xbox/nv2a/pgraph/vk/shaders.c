@@ -854,7 +854,7 @@ bool pgraph_vk_shaders_ready(PGRAPHState *pg)
     if (!s_as.on) return true;
     if (pg->clearing) return true;
 
-    bool zeta_bound = r->zeta_binding != NULL && r->device_props.vendorID != 0x13B5;
+    bool zeta_bound = r->zeta_binding != NULL && !NV2A_MOBILE_PATH(r);
     if (r->shader_binding && r->shader_binding->state.psh.zeta_bound == zeta_bound &&
         !pgraph_glsl_check_shader_state_dirty(pg, &r->shader_binding->state))
         return true;
@@ -927,7 +927,7 @@ void pgraph_vk_bind_shaders(PGRAPHState *pg)
 
     r->shader_bindings_changed = false;
 
-    bool zeta_bound = r->zeta_binding != NULL && r->device_props.vendorID != 0x13B5;
+    bool zeta_bound = r->zeta_binding != NULL && !NV2A_MOBILE_PATH(r);
     if (!r->shader_binding ||
         r->shader_binding->state.psh.zeta_bound != zeta_bound ||
         pgraph_glsl_check_shader_state_dirty(pg, &r->shader_binding->state)) {

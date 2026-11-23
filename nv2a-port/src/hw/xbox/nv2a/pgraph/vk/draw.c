@@ -1418,7 +1418,7 @@ static bool nv2a_hw_bias(PGRAPHVkState *r)
 {
     static int off = -1;
     if (off < 0) off = getenv("NV2A_NO_HWBIAS") != NULL;
-    return !off && r->device_props.vendorID == 0x13B5;
+    return !off && NV2A_MOBILE_PATH(r);
 }
 
 static void set_hw_depth_bias(PGRAPHState *pg, PGRAPHVkState *r)
@@ -4474,7 +4474,7 @@ static VertexBufferRemap remap_unaligned_attributes(PGRAPHState *pg,
          * NV2A_NO_REPACK=1 turns this off. */
         static int repack = -1;
         if (repack < 0)
-            repack = r->device_props.vendorID == 0x13B5 && !getenv("NV2A_NO_REPACK");
+            repack = NV2A_MOBILE_PATH(r) && !getenv("NV2A_NO_REPACK");
         bool mali_bad = repack &&
             ((r->vertex_attribute_offsets[attr_id] % 4) || (desc->stride % 4) ||
              (pg->w1_attrs & (1 << attr_id)));

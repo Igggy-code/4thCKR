@@ -19,6 +19,24 @@
 
 #ifndef HW_XBOX_NV2A_PGRAPH_VK_RENDERER_H
 #define HW_XBOX_NV2A_PGRAPH_VK_RENDERER_H
+#include <stdlib.h>
+
+/* nv2a-port: the drawing path made and tested on Mali phones (no geometry
+ * shaders, depth from the vertex with rasteriser bias, repacked 4-byte
+ * aligned vertex data with w = 1, SPIR-V 1.5). On Android every GPU takes
+ * it: Adreno's driver mis-drew the desktop path (the world missing, only
+ * particles left). Off Android only Mali does. */
+#ifdef __ANDROID__
+static inline int nv2a_mobile_path_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("NV2A_DESKTOP_PATH") == NULL;
+    return on;
+}
+#define NV2A_MOBILE_PATH(r) ((void)(r), nv2a_mobile_path_on())
+#else
+#define NV2A_MOBILE_PATH(r) ((r)->device_props.vendorID == 0x13B5)
+#endif
 
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
