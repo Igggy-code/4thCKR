@@ -724,16 +724,14 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
     private void drawEditor(Canvas cv) {
         cv.drawColor(0x66000000);
-        boolean ru = uiRu();
+        // where the floating sticks live: a faint label in the empty middle
+        // (the how-to is on the bar)
+        text.setTextSize(baseText * 0.85f);
+        text.setColor(0x80F4E6C8);
+        cv.drawText(editLayer == LAYER_AIM ? "Camera stick: left half of the screen while aiming"
+                                           : "Movement stick: left half of the screen",
+                getWidth() * 0.27f, getHeight() * 0.62f, text);
         text.setTextSize(baseText);
-        text.setColor(0xCCF4E6C8);
-        String zone = editLayer == LAYER_AIM
-                ? (ru ? "Прицеливание: камера под левым большим пальцем" : "Aiming: the camera stick moves under the left thumb")
-                : (ru ? "Левая половина экрана: стик движения" : "Left half of the screen: the movement stick");
-        cv.drawText(zone, getWidth() * 0.27f, getHeight() * 0.62f, text);
-        cv.drawText(ru ? "Коснитесь кнопки, чтобы выбрать её; перетащите, чтобы передвинуть"
-                       : "Tap a button to select it, drag it to move it",
-                getWidth() / 2f, getHeight() - 14 * dp, text);
         for (int k = 0; k < EDIT_IDX.length; k++) {
             Ctl c = ctls[EDIT_IDX[k]];
             if (c.rect != null) drawRect(cv, c); else drawCircle(cv, c, c.color, true);
