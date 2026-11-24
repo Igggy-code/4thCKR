@@ -5252,3 +5252,21 @@ static void flush_draw_impl(NV2AState *d)
         NV2A_VK_DPRINTF("EMPTY NV097_SET_BEGIN_END");
     }
 }
+
+/* nv2a-port: the GPU side of a freeze, for the hang watchdog (conker main.c) */
+void nv2a_debug_sync_state(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->pgraph.vk_renderer_state) return;
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    fprintf(stderr, "[HANG] GPU: get %08x put %08x, waiting nop %d flip %d, in cb %d, slots pending %d/%d "
+                    "(submits %llu, completed %llu), reports queued %d, in slots %d/%d, "
+                    "deferred semaphores %d (last released %08x)\n",
+            d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET], d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT],
+            (int)qatomic_read(&d->pgraph.waiting_for_nop), (int)qatomic_read(&d->pgraph.waiting_for_flip),
+            r->in_command_buffer, r->slot_pending[0], r->slot_pending[1],
+            (unsigned long long)r->submit_count, (unsigned long long)r->completed_submits,
+            !QSIMPLEQ_EMPTY(&r->report_queue),
+            !QSIMPLEQ_EMPTY(&r->slot_reports[0]), !QSIMPLEQ_EMPTY(&r->slot_reports[1]),
+            s_semq_n, s_last_rel);
+}

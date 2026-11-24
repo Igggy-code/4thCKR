@@ -970,6 +970,17 @@ static void *hang_watch(void *arg)
         if (++still == 6 && !dumped) {
             dumped = 1;
             fprintf(stderr, "[HANG] no frame for 6 s (frame %u): stacks follow\n", f);
+            {   /* where the title's and the GPU's fences stand */
+                extern void nv2a_debug_sync_state(void);
+                extern volatile uint32_t nv2a_semwait_fence, nv2a_semwait_active;
+                uint32_t dev = *(volatile uint32_t *)((uintptr_t)0x005499E8u + g_xbox_mem_offset);
+                uint32_t now_t = dev ? *(volatile uint32_t *)((uintptr_t)(dev + 0x2C) + g_xbox_mem_offset) : 0;
+                uint32_t semp = dev ? *(volatile uint32_t *)((uintptr_t)(dev + 0x30) + g_xbox_mem_offset) : 0;
+                uint32_t semv = semp ? *(volatile uint32_t *)((uintptr_t)semp + g_xbox_mem_offset) : 0;
+                fprintf(stderr, "[HANG] D3D: time %08x, semaphore at %08x = %08x, waiting for fence %08x (%d)\n",
+                        now_t, semp, semv, nv2a_semwait_fence, (int)nv2a_semwait_active);
+                nv2a_debug_sync_state();
+            }
             dump_all_threads(NULL);
             if (f > 1) save_hang_log("noflip");   /* frame 1: still the boot black screen */
         }

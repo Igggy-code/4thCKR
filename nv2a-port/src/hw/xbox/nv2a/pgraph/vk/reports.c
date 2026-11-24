@@ -289,8 +289,12 @@ void pgraph_vk_process_pending_reports(NV2AState *d)
          * its command stream with a visibility test in flight -- 15 ms a
          * frame in the lava levels on a throttled phone. Retire what has
          * finished, without blocking. NV2A_REPORT_WAIT=1: wait, as before. */
+        /* 0.7.27: back to waiting by default -- a freeze at a cutscene's
+         * end (title in D3D's fence wait, GPU idle) came with the
+         * non-blocking way, and the two are not proven unrelated.
+         * NV2A_REPORT_NOWAIT=1: the non-blocking way. */
         static int wait = -1;
-        if (wait < 0) wait = getenv("NV2A_REPORT_WAIT") != NULL ||
+        if (wait < 0) wait = getenv("NV2A_REPORT_NOWAIT") == NULL ||
                              getenv("NV2A_NO_PROVISIONAL_REPORT") != NULL;
         if (wait) pgraph_vk_wait_deferred();
         else pgraph_vk_poll_slots();
