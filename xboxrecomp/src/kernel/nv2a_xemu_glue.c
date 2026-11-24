@@ -259,11 +259,12 @@ int nv2a_host_probe_peek(uint64_t addr)
     return r;
 }
 /* fault on a probed page: note who, open the probed ranges on that page */
-static void probe_touch(uint32_t page, int own, void *ucv)
+static void probe_touch(uint32_t page, uint32_t phys, int own, void *ucv)
 {
+    uintptr_t pc = 0, lr = 0;
 #if defined(__aarch64__)
-    nv2a_probe_last_pc = (uintptr_t)((ucontext_t *)ucv)->uc_mcontext.pc;
-    nv2a_probe_last_lr = (uintptr_t)((ucontext_t *)ucv)->uc_mcontext.regs[30];
+    pc = (uintptr_t)((ucontext_t *)ucv)->uc_mcontext.pc;
+    lr = (uintptr_t)((ucontext_t *)ucv)->uc_mcontext.regs[30];
 #else
     (void)ucv;
 #endif
@@ -272,7 +273,13 @@ static void probe_touch(uint32_t page, int own, void *ucv)
     for (unsigned i = 0; i < s_probe_n; i++) {
         if (!s_probe[i].live) continue;
         uint64_t pa = s_probe[i].addr, pb = pa + s_probe[i].size;
-        if (pb <= a || pa >= b) continue;
+        /* the accessed byte itself: a page shared with a neighbour (targets
+         * are not page aligned) is no access to this target */
+        if (phys < pa || phys >= pb) continue;
+        (void)a; (void)b;
+        if (!s_probe[i].own && !s_probe[i].title) {   /* the first access: who */
+            nv2a_probe_last_pc = pc; nv2a_probe_last_lr = lr;
+        }
         if (own) s_probe[i].own = 1; else s_probe[i].title = 1;
     }
     if (s_guard[page] == 2) { s_guard[page] = 0; restore_page_prot(page); }
@@ -736,7 +743,7 @@ int xbox_Nv2aXemuFault(void *ucv, uintptr_t fault)
         if (va >= s_views[v] && va < s_views[v] + RAM_SIZE) {
             uint32_t page = (va - s_views[v]) / PAGE;
             if (s_guard && __atomic_load_n(&s_guard[page], __ATOMIC_ACQUIRE) == 2) {
-                probe_touch(page, (int)syscall(SYS_gettid) == s_pfifo_tid, ucv);
+                probe_touch(page, va - s_views[v], (int)syscall(SYS_gettid) == s_pfifo_tid, ucv);
                 return 1;   /* retry the access */
             }
             if (s_guard && __atomic_load_n(&s_guard[page], __ATOMIC_ACQUIRE)) {

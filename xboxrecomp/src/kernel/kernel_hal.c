@@ -171,11 +171,15 @@ void xbox_IrqlDumpHolders(void)
             xbox_IrqlRaisedCount(), xbox_IrqlTransitions());
     for (i = 0; i < IRQL_HOLDERS; i++) {
         LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
-        if (t)
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p, "
+        if (t) {
+            Dl_info di = {0};
+            int ok = s_holders[i].ra && dladdr(s_holders[i].ra, &di) && di.dli_sname;
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p (%s+0x%lx), "
                     "guest ret %08X (esp %08X)\n",
-                    (unsigned long)t, s_holders[i].ra,
+                    (unsigned long)t, s_holders[i].ra, ok ? di.dli_sname : "?",
+                    ok ? (unsigned long)((uintptr_t)s_holders[i].ra - (uintptr_t)di.dli_saddr) : 0ul,
                     s_holders[i].guest_ra, s_holders[i].guest_esp);
+        }
     }
     fflush(stderr);
 }
