@@ -68,7 +68,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     private int padMode = Settings.PAD_AUTO;
     private boolean recVisible = false, menuOpen = false, firstFrameSeen = false;
     void setMenuHost(MenuHost h) { menuHost = h; }
-    void setPadMode(int m) { padMode = m; revealUntil = 0; if (m == Settings.PAD_ALWAYS) { cinemaHidden = false; updateVisibility(); } invalidate(); }
+    void setPadMode(int m) { padMode = m; revealUntil = 0; if (m == Settings.PAD_ALWAYS) { cinemaHidden = false; updateVisibility(); } applyLayout(); invalidate(); }
     void setRecVisible(boolean v) { recVisible = v; invalidate(); }
     void setMenuOpen(boolean o) { menuOpen = o; if (o) releaseAll(); }
     // edge swipe opens the menu
@@ -549,13 +549,13 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
         text.setTextSize(15 * s);
         baseText = 15 * s;
-        for (int k = 0; k < EDIT_IDX.length; k++) {   // the defaults, for the player's layout
-            Ctl c = ctls[EDIT_IDX[k]];
+        for (int i = 0; i < ctls.length; i++) {   // the defaults, for the player's layout
+            Ctl c = ctls[i];
             if (c.rect != null) {
-                defCx[k] = c.rect.centerX(); defCy[k] = c.rect.centerY();
-                defW[k] = c.rect.width(); defH[k] = c.rect.height(); defR[k] = 0;
+                defCx[i] = c.rect.centerX(); defCy[i] = c.rect.centerY();
+                defW[i] = c.rect.width(); defH[i] = c.rect.height(); defR[i] = 0;
             } else {
-                defCx[k] = c.cx; defCy[k] = c.cy; defR[k] = c.r; defW[k] = defH[k] = 0;
+                defCx[i] = c.cx; defCy[i] = c.cy; defR[i] = c.r; defW[i] = defH[i] = 0;
             }
         }
         haveDefaults = true;
@@ -564,65 +564,79 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
     // ---- the player's layout: per mode, where each button sits and how big -----------------
 
-    /** Buttons the player can move and resize: A B X Y, L R, START (the
-     *  sticks float under the thumb, the rest is hidden in single player). */
-    private static final int[] EDIT_IDX = { 0, 1, 2, 3, 6, 7, 9 };
-    static final int LAYER_BASIC = 0, LAYER_AIM = 1;
-    private final float[] defCx = new float[EDIT_IDX.length], defCy = new float[EDIT_IDX.length],
-            defR = new float[EDIT_IDX.length], defW = new float[EDIT_IDX.length], defH = new float[EDIT_IDX.length];
+    static final int LAYER_BASIC = 0, LAYER_AIM = 1, LAYER_ALWAYS = 2;
+    /** Buttons the player can move and resize, per layer (indices into ctls).
+     *  Basic / aiming: A B X Y, L R, START (the sticks float under the thumb,
+     *  the rest is hidden in single player). Always shown: every Xbox button. */
+    private static final int[][] EDIT_SET = {
+        { 0, 1, 2, 3, 6, 7, 9 },
+        { 0, 1, 2, 3, 6, 7, 9 },
+        { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 },
+    };
+    private static final int NCTL = 12;
+    private final float[] defCx = new float[NCTL], defCy = new float[NCTL],
+            defR = new float[NCTL], defW = new float[NCTL], defH = new float[NCTL];
     private boolean haveDefaults;
     private float baseText;
-    /** [layer][k*3 + 0..2]: centre x, y (fractions of the view), scale; NaN = default */
-    private final float[][] lay = new float[2][EDIT_IDX.length * 3];
+    /** [layer][ctl*3 + 0..2]: centre x, y (fractions of the view), scale; NaN = default */
+    private final float[][] lay = new float[3][NCTL * 3];
 
     private void loadLayout() {
         for (float[] l : lay) java.util.Arrays.fill(l, Float.NaN);
-        String v = new Settings(getContext()).padLayout();
+        Settings st = new Settings(getContext());
+        String v = st.padLayout();
+        boolean v1 = false;
+        if (v == null || v.isEmpty()) { v = st.padLayoutV1(); v1 = true; }   // 0.7.30-0.7.32: by edit slot
         if (v == null || v.isEmpty()) return;
         for (String e : v.split(";")) {
             String[] f = e.split(",");
             if (f.length != 5) continue;
             try {
-                int layer = Integer.parseInt(f[0]), k = Integer.parseInt(f[1]);
-                if (layer < 0 || layer > 1 || k < 0 || k >= EDIT_IDX.length) continue;
-                lay[layer][k * 3] = Float.parseFloat(f[2]);
-                lay[layer][k * 3 + 1] = Float.parseFloat(f[3]);
-                lay[layer][k * 3 + 2] = Float.parseFloat(f[4]);
+                int layer = Integer.parseInt(f[0]), i = Integer.parseInt(f[1]);
+                if (v1) i = i >= 0 && i < EDIT_SET[0].length ? EDIT_SET[0][i] : -1;
+                if (layer < 0 || layer >= lay.length || i < 0 || i >= NCTL) continue;
+                lay[layer][i * 3] = Float.parseFloat(f[2]);
+                lay[layer][i * 3 + 1] = Float.parseFloat(f[3]);
+                lay[layer][i * 3 + 2] = Float.parseFloat(f[4]);
             } catch (NumberFormatException ex) { /* skip it */ }
         }
     }
 
     private void saveLayout() {
         StringBuilder b = new StringBuilder();
-        for (int layer = 0; layer < 2; layer++)
-            for (int k = 0; k < EDIT_IDX.length; k++) {
+        for (int layer = 0; layer < lay.length; layer++)
+            for (int i = 0; i < NCTL; i++) {
                 float[] l = lay[layer];
-                if (Float.isNaN(l[k * 3]) && Float.isNaN(l[k * 3 + 2])) continue;
+                if (Float.isNaN(l[i * 3]) && Float.isNaN(l[i * 3 + 2])) continue;
                 if (b.length() > 0) b.append(';');
-                b.append(layer).append(',').append(k).append(',')
-                 .append(l[k * 3]).append(',').append(l[k * 3 + 1]).append(',').append(l[k * 3 + 2]);
+                b.append(layer).append(',').append(i).append(',')
+                 .append(l[i * 3]).append(',').append(l[i * 3 + 1]).append(',').append(l[i * 3 + 2]);
             }
-        new Settings(getContext()).setPadLayout(b.toString());
+        new Settings(getContext()).setPadLayout(b.toString().isEmpty() ? "-" : b.toString());
     }
 
-    private int layoutLayer() { return editMode ? editLayer : (aimMode ? LAYER_AIM : LAYER_BASIC); }
+    private int layoutLayer() {
+        if (editMode) return editLayer;
+        if (padMode == Settings.PAD_ALWAYS) return LAYER_ALWAYS;
+        return aimMode ? LAYER_AIM : LAYER_BASIC;
+    }
 
-    /** Place the editable buttons for the current mode: defaults, then the player's changes. */
+    /** Place the buttons for the current mode: defaults, then the player's changes. */
     private void applyLayout() {
         if (!haveDefaults) return;
         float w = getWidth(), h = getHeight();
         float[] l = lay[layoutLayer()];
-        for (int k = 0; k < EDIT_IDX.length; k++) {
-            Ctl c = ctls[EDIT_IDX[k]];
-            float x = Float.isNaN(l[k * 3]) ? defCx[k] : l[k * 3] * w;
-            float y = Float.isNaN(l[k * 3 + 1]) ? defCy[k] : l[k * 3 + 1] * h;
-            float sc = Float.isNaN(l[k * 3 + 2]) ? 1f : l[k * 3 + 2];
+        for (int i = 0; i < NCTL && i < ctls.length; i++) {
+            Ctl c = ctls[i];
+            float x = Float.isNaN(l[i * 3]) ? defCx[i] : l[i * 3] * w;
+            float y = Float.isNaN(l[i * 3 + 1]) ? defCy[i] : l[i * 3 + 1] * h;
+            float sc = Float.isNaN(l[i * 3 + 2]) ? 1f : l[i * 3 + 2];
             c.sc = sc;
-            if (defR[k] == 0) {
-                float hw = defW[k] * sc / 2f, hh = defH[k] * sc / 2f;
+            if (defR[i] == 0) {
+                float hw = defW[i] * sc / 2f, hh = defH[i] * sc / 2f;
                 c.rect = new RectF(x - hw, y - hh, x + hw, y + hh);
             } else {
-                c.rect = null; c.cx = x; c.cy = y; c.r = defR[k] * sc;
+                c.rect = null; c.cx = x; c.cy = y; c.r = defR[i] * sc;
             }
         }
     }
@@ -636,6 +650,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     private LayoutEditListener editListener;
 
     boolean isEditingLayout() { return editMode; }
+    /** the layer the editor opens on: the one in use now */
+    int currentLayer() { return padMode == Settings.PAD_ALWAYS ? LAYER_ALWAYS : LAYER_BASIC; }
 
     void beginLayoutEdit(int layer, LayoutEditListener l) {
         releaseAll();
@@ -652,7 +668,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
     void setEditScale(int pct) {
         if (!editMode || editSel < 0) return;
-        lay[editLayer][editSel * 3 + 2] = Math.max(50, Math.min(300, pct)) / 100f;
+        lay[editLayer][editSel * 3 + 2] = Math.max(50, Math.min(300, pct)) / 100f;   // editSel: a ctls index
         applyLayout(); invalidate();
     }
 
@@ -672,7 +688,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         if (editListener == null) return;
         if (editSel < 0) { editListener.onSelection(null, 100); return; }
         float sc = lay[editLayer][editSel * 3 + 2];
-        editListener.onSelection(ctls[EDIT_IDX[editSel]].label, Math.round((Float.isNaN(sc) ? 1f : sc) * 100));
+        editListener.onSelection(ctlName(editSel), Math.round((Float.isNaN(sc) ? 1f : sc) * 100));
     }
 
     private boolean editTouch(MotionEvent e) {
@@ -683,11 +699,12 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 if (editPid != -1) break;
                 float x = e.getX(idx), y = e.getY(idx);
                 int hit = -1;
-                for (int k = EDIT_IDX.length - 1; k >= 0 && hit < 0; k--)
-                    if (ctls[EDIT_IDX[k]].hit(x, y, 10 * dp)) hit = k;
+                int[] set = EDIT_SET[editLayer];
+                for (int k = set.length - 1; k >= 0 && hit < 0; k--)
+                    if (ctls[set[k]].hit(x, y, 10 * dp)) hit = set[k];
                 editSel = hit;
                 if (hit >= 0) {
-                    Ctl c = ctls[EDIT_IDX[hit]];
+                    Ctl c = ctls[hit];
                     float cx = c.rect != null ? c.rect.centerX() : c.cx, cy = c.rect != null ? c.rect.centerY() : c.cy;
                     editOffX = x - cx; editOffY = y - cy;
                     editPid = e.getPointerId(idx);
@@ -729,13 +746,15 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         text.setTextSize(baseText * 0.85f);
         text.setColor(0x80F4E6C8);
         cv.drawText(editLayer == LAYER_AIM ? "Camera stick: left half of the screen while aiming"
-                                           : "Movement stick: left half of the screen",
+                    : editLayer == LAYER_ALWAYS ? "Sticks: under the thumb, left and right halves"
+                    : "Movement stick: left half of the screen",
                 getWidth() * 0.27f, getHeight() * 0.62f, text);
         text.setTextSize(baseText);
-        for (int k = 0; k < EDIT_IDX.length; k++) {
-            Ctl c = ctls[EDIT_IDX[k]];
-            if (c.rect != null) drawRect(cv, c); else drawCircle(cv, c, c.color, true);
-            if (k == editSel) {
+        for (int i : EDIT_SET[editLayer]) {
+            Ctl c = ctls[i];
+            if (c == dpad) drawDpad(cv);
+            else if (c.rect != null) drawRect(cv, c); else drawCircle(cv, c, c.color, true);
+            if (i == editSel) {
                 Paint hl = new Paint(Paint.ANTI_ALIAS_FLAG);
                 hl.setStyle(Paint.Style.STROKE);
                 hl.setStrokeWidth(3.5f * dp);
@@ -973,7 +992,17 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
 
     // ---- opacity / idle fade ------------------------------------------------------------------
 
+    private String ctlName(int i) {
+        Ctl c = ctls[i];
+        if (c == dpad) return "D-pad";
+        if (i == 4) return "White";
+        if (i == 5) return "Black";
+        return c.label;
+    }
+
     private boolean isOptional(Ctl c) {
+        // "Always shown": the whole Xbox pad (the player may need any of it)
+        if (padMode == Settings.PAD_ALWAYS && !editMode) return c == toggle;
         // Single player needs neither the D-pad nor BACK (multiplayer stats):
         // hidden and inactive. Injected presses (tests) still work.
         // White / Black (WH, BK) are unused too.

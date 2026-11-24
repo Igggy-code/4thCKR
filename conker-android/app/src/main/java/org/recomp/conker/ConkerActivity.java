@@ -120,7 +120,11 @@ public class ConkerActivity extends SDLActivity implements TouchGamepadView.Menu
         if (layout != null && gamepadView != null && ext != null && new java.io.File(ext, "nv2a_test_layout").exists()) {
             final ViewGroup root = layout;
             new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
-                    () -> ControlsLayoutBar.open(this, root, gamepadView), 20000);
+                    () -> {
+                        ControlsLayoutBar.open(this, root, gamepadView);
+                        if (new java.io.File(ext, "nv2a_test_layout_always").exists())
+                            ControlsLayoutBar.testLayer(TouchGamepadView.LAYER_ALWAYS);
+                    }, 20000);
         }
     }
 

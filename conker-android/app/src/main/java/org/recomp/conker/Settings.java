@@ -38,8 +38,9 @@ final class Settings {
     }
 
     /** On-screen controller layout set by the player (TouchGamepadView): "" = defaults. */
-    String padLayout() { return p.getString("pad_layout_v1", ""); }
-    void setPadLayout(String v) { p.edit().putString("pad_layout_v1", v).apply(); }
+    String padLayout() { return p.getString("pad_layout_v2", ""); }
+    String padLayoutV1() { return p.getString("pad_layout_v1", ""); }
+    void setPadLayout(String v) { p.edit().putString("pad_layout_v2", v).apply(); }
     int padMode() { return p.getInt("pad_mode", PAD_AUTO); }
     void setPadMode(int m) { p.edit().putInt("pad_mode", m).apply(); }
     int scale() { return p.getInt("scale", 2); }   // x2 by default: sharper

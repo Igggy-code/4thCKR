@@ -18,7 +18,8 @@ import android.widget.TextView;
 final class ControlsLayoutBar extends FrameLayout {
     private static final int CREAM = 0xFFF4E6C8, CREAM_DIM = 0xB3F4E6C8, AMBER = 0xFFF2B35A,
             CARD = 0xEB1E1812, LINE = 0x33FFFFFF, TONAL = 0x29F2B35A, INK = 0xFF2A1C0C;
-    private static final String[] MODES = { "Basic controls", "Aiming (shooting)" };
+    private static final String[] MODES = { "Basic controls", "Aiming (shooting)",
+            "Always-on controls (\"Always shown\" mode)" };
     private static ControlsLayoutBar sOpen;
 
     private final TouchGamepadView pad;
@@ -33,8 +34,11 @@ final class ControlsLayoutBar extends FrameLayout {
         ControlsLayoutBar b = new ControlsLayoutBar(a, pad);
         root.addView(b, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         sOpen = b;
-        pad.beginLayoutEdit(TouchGamepadView.LAYER_BASIC, b::onSelection);
+        pad.beginLayoutEdit(b.layer, b::onSelection);
     }
+
+    /** tests: show another layer */
+    static void testLayer(int l) { if (sOpen != null) sOpen.setLayer(l); }
 
     /** Back while editing: done. */
     static boolean closeIfOpen() {
@@ -115,7 +119,8 @@ final class ControlsLayoutBar extends FrameLayout {
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         lp.topMargin = px(84);   // below the L / R / START row
         addView(card, lp);
-        setLayer(TouchGamepadView.LAYER_BASIC);
+        layer = pad.currentLayer();
+        mode.setText(MODES[layer] + "   ▾");
         onSelection(null, 100);
     }
 
