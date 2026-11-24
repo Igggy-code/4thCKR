@@ -26,6 +26,7 @@ final class ControlsLayoutBar extends FrameLayout {
     private final float dp;
     private final TextView mode, selName, pct, hint;
     private final SeekBar scale;
+    private TextView fixL, fixR;
     private int layer = TouchGamepadView.LAYER_BASIC;
     private boolean quiet;   // setting the slider from code
 
@@ -113,6 +114,11 @@ final class ControlsLayoutBar extends FrameLayout {
         LinearLayout.LayoutParams hl = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         hl.setMargins(px(4), 0, 0, 0);
         row2.addView(hint, hl);
+        // fixed sticks: shown all the time, and movable here
+        fixL = chip("Fixed left stick", pad.fixedLeftStick(), on -> pad.setFixedSticks(on, pad.fixedRightStick()));
+        fixR = chip("Fixed right stick", pad.fixedRightStick(), on -> pad.setFixedSticks(pad.fixedLeftStick(), on));
+        row2.addView(fixL);
+        row2.addView(fixR);
         row2.addView(pill("Reset to default", false, v -> pad.resetEditLayer()));
 
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -154,9 +160,8 @@ final class ControlsLayoutBar extends FrameLayout {
 
     private void onSelection(String name, int scalePct) {
         boolean sel = name != null;
-        selName.setText(sel ? "Button " + name : "None selected");
-        hint.setText(sel ? "Drag it to move it · use the slider to resize it · tap another button to switch"
-                         : "Tap a button to select it, then drag it where you want it");
+        selName.setText(sel ? name : "None selected");
+        hint.setText(sel ? "Drag to move · slider to resize" : "Tap a control, then drag it");
         scale.setEnabled(sel);
         scale.setAlpha(sel ? 1f : 0.35f);
         pct.setAlpha(sel ? 1f : 0.35f);
@@ -190,6 +195,27 @@ final class ControlsLayoutBar extends FrameLayout {
         t.setTextSize(size);
         t.setGravity(Gravity.CENTER);
         return t;
+    }
+
+    interface OnToggle { void toggled(boolean on); }
+
+    /** a check chip: ✓ and amber when on */
+    private TextView chip(String s, boolean on, OnToggle l) {
+        TextView b = label("", 12.5f, CREAM);
+        b.setPadding(px(12), 0, px(12), 0);
+        final boolean[] st = { on };
+        Runnable paint = () -> {
+            b.setText((st[0] ? "✓  " : "") + s);
+            b.setTextColor(st[0] ? INK : CREAM);
+            b.setBackground(round(st[0] ? AMBER : 0x14FFFFFF, 16, st[0] ? 0 : LINE));
+        };
+        paint.run();
+        b.setClickable(true);
+        b.setOnClickListener(v -> { st[0] = !st[0]; paint.run(); l.toggled(st[0]); });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, px(32));
+        lp.setMargins(px(8), 0, 0, 0);
+        b.setLayoutParams(lp);
+        return b;
     }
 
     /** rounded pill button: filled (primary) or tonal */

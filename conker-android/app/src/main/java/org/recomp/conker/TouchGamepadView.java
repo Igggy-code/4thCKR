@@ -558,6 +558,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 defCx[i] = c.cx; defCy[i] = c.cy; defR[i] = c.r; defW[i] = defH[i] = 0;
             }
         }
+        defCx[SLOT_LSTICK] = 125 * s; defCy[SLOT_LSTICK] = h - 175 * s; defR[SLOT_LSTICK] = 62 * s;
+        defCx[SLOT_RSTICK] = w - 280 * s; defCy[SLOT_RSTICK] = h - 80 * s; defR[SLOT_RSTICK] = 55 * s;
         haveDefaults = true;
         applyLayout();
     }
@@ -573,7 +575,11 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         { 0, 1, 2, 3, 6, 7, 9 },
         { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 },
     };
-    private static final int NCTL = 12;
+    /** lay[] slots beyond the buttons: the stick under the left thumb (the
+     *  movement stick, or the camera stick while aiming) and the right one */
+    private static final int SLOT_LSTICK = 12, SLOT_RSTICK = 13;
+    private static final int NCTL = 14;
+    private boolean fixedL, fixedR;   // sticks fixed in place (shown, movable in the editor)
     private final float[] defCx = new float[NCTL], defCy = new float[NCTL],
             defR = new float[NCTL], defW = new float[NCTL], defH = new float[NCTL];
     private boolean haveDefaults;
@@ -584,6 +590,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     private void loadLayout() {
         for (float[] l : lay) java.util.Arrays.fill(l, Float.NaN);
         Settings st = new Settings(getContext());
+        fixedL = st.fixedLeftStick(); fixedR = st.fixedRightStick();
         String v = st.padLayout();
         boolean v1 = false;
         if (v == null || v.isEmpty()) { v = st.padLayoutV1(); v1 = true; }   // 0.7.30-0.7.32: by edit slot
@@ -626,7 +633,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         if (!haveDefaults) return;
         float w = getWidth(), h = getHeight();
         float[] l = lay[layoutLayer()];
-        for (int i = 0; i < NCTL && i < ctls.length; i++) {
+        for (int i = 0; i < ctls.length; i++) {
             Ctl c = ctls[i];
             float x = Float.isNaN(l[i * 3]) ? defCx[i] : l[i * 3] * w;
             float y = Float.isNaN(l[i * 3 + 1]) ? defCy[i] : l[i * 3 + 1] * h;
@@ -639,6 +646,50 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 c.rect = null; c.cx = x; c.cy = y; c.r = defR[i] * sc;
             }
         }
+        // sticks: the left slot is the movement stick, or the camera stick while aiming
+        float[] ls = slot(l, SLOT_LSTICK, w, h), rs = slot(l, SLOT_RSTICK, w, h);
+        boolean aimNow = editMode ? editLayer == LAYER_AIM : aimMode;
+        lstick.homeX = ls[0]; lstick.homeY = ls[1]; lstick.radius = ls[2];
+        rHomeX = rs[0]; rHomeY = rs[1]; rRadius = rs[2];
+        if (aimNow) { rstick.homeX = ls[0]; rstick.homeY = ls[1]; rstick.radius = ls[2]; }
+        else { rstick.homeX = rs[0]; rstick.homeY = rs[1]; rstick.radius = rs[2]; }
+        if (lstick.pointer == -1) resetStick(lstick);
+        if (rstick.pointer == -1) resetStick(rstick);
+    }
+
+    private float[] slot(float[] l, int i, float w, float h) {
+        float sc = Float.isNaN(l[i * 3 + 2]) ? 1f : l[i * 3 + 2];
+        return new float[] { Float.isNaN(l[i * 3]) ? defCx[i] : l[i * 3] * w,
+                             Float.isNaN(l[i * 3 + 1]) ? defCy[i] : l[i * 3 + 1] * h, defR[i] * sc };
+    }
+
+    /** the editable items of a layer: its buttons, and the sticks the player fixed */
+    private int[] editSet(int layer) {
+        int[] b = EDIT_SET[layer];
+        int n = b.length + (fixedL ? 1 : 0) + (fixedR && layer != LAYER_AIM ? 1 : 0);
+        int[] r = java.util.Arrays.copyOf(b, n);
+        int k = b.length;
+        if (fixedL) r[k++] = SLOT_LSTICK;
+        if (fixedR && layer != LAYER_AIM) r[k] = SLOT_RSTICK;
+        return r;
+    }
+
+    private boolean slotHit(int i, float x, float y, float slop) {
+        Stick st = i == SLOT_LSTICK ? (editLayer == LAYER_AIM ? rstick : lstick) : rstick;
+        float dx = x - st.homeX, dy = y - st.homeY, rr = st.radius + slop;
+        return dx * dx + dy * dy <= rr * rr;
+    }
+
+    boolean fixedLeftStick() { return fixedL; }
+    boolean fixedRightStick() { return fixedR; }
+    void setFixedSticks(boolean l, boolean r) {
+        fixedL = l; fixedR = r;
+        Settings st = new Settings(getContext());
+        st.setFixedLeftStick(l); st.setFixedRightStick(r);
+        if (editMode && editSel >= NCTL - 2 && !((editSel == SLOT_LSTICK && l) || (editSel == SLOT_RSTICK && r))) {
+            editSel = -1; notifyEdit();
+        }
+        applyLayout(); invalidate();
     }
 
     // ---- layout editor (Settings -> Configure controls layout) ------------------------------
@@ -699,13 +750,21 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                 if (editPid != -1) break;
                 float x = e.getX(idx), y = e.getY(idx);
                 int hit = -1;
-                int[] set = EDIT_SET[editLayer];
-                for (int k = set.length - 1; k >= 0 && hit < 0; k--)
-                    if (ctls[set[k]].hit(x, y, 10 * dp)) hit = set[k];
+                int[] set = editSet(editLayer);
+                for (int k = set.length - 1; k >= 0 && hit < 0; k--) {
+                    int i = set[k];
+                    if (i >= ctls.length ? slotHit(i, x, y, 6 * dp) : ctls[i].hit(x, y, 10 * dp)) hit = i;
+                }
                 editSel = hit;
                 if (hit >= 0) {
-                    Ctl c = ctls[hit];
-                    float cx = c.rect != null ? c.rect.centerX() : c.cx, cy = c.rect != null ? c.rect.centerY() : c.cy;
+                    float cx, cy;
+                    if (hit >= ctls.length) {
+                        Stick st = hit == SLOT_LSTICK ? (editLayer == LAYER_AIM ? rstick : lstick) : rstick;
+                        cx = st.homeX; cy = st.homeY;
+                    } else {
+                        Ctl c = ctls[hit];
+                        cx = c.rect != null ? c.rect.centerX() : c.cx; cy = c.rect != null ? c.rect.centerY() : c.cy;
+                    }
                     editOffX = x - cx; editOffY = y - cy;
                     editPid = e.getPointerId(idx);
                     haptic();
@@ -745,12 +804,26 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         // (the how-to is on the bar)
         text.setTextSize(baseText * 0.85f);
         text.setColor(0x80F4E6C8);
-        cv.drawText(editLayer == LAYER_AIM ? "Camera stick: left half of the screen while aiming"
+        if (!fixedL) cv.drawText(editLayer == LAYER_AIM ? "Camera stick: left half of the screen while aiming"
                     : editLayer == LAYER_ALWAYS ? "Sticks: under the thumb, left and right halves"
                     : "Movement stick: left half of the screen",
                 getWidth() * 0.27f, getHeight() * 0.62f, text);
         text.setTextSize(baseText);
-        for (int i : EDIT_SET[editLayer]) {
+        for (int i : editSet(editLayer)) {
+            if (i >= ctls.length) {   // a fixed stick
+                Stick st = i == SLOT_LSTICK ? (editLayer == LAYER_AIM ? rstick : lstick) : rstick;
+                drawStickIdle(cv, st);
+                text.setTextSize(baseText * 0.8f);
+                text.setColor(0xCCF4E6C8);
+                cv.drawText(ctlName(i), st.homeX, st.homeY + st.radius + 16 * dp, text);
+                text.setTextSize(baseText);
+                if (i == editSel) {
+                    Paint hl = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    hl.setStyle(Paint.Style.STROKE); hl.setStrokeWidth(3.5f * dp); hl.setColor(0xFFF2C46B);
+                    cv.drawCircle(st.homeX, st.homeY, st.radius + 5 * dp, hl);
+                }
+                continue;
+            }
             Ctl c = ctls[i];
             if (c == dpad) drawDpad(cv);
             else if (c.rect != null) drawRect(cv, c); else drawCircle(cv, c, c.color, true);
@@ -769,6 +842,11 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     }
 
     private static void place(Ctl c, float x, float y, float r) { c.cx = x; c.cy = y; c.r = r; c.rect = null; }
+
+    private boolean near(Stick st, float x, float y) {
+        float dx = x - st.homeX, dy = y - st.homeY, rr = st.radius * 1.35f;
+        return dx * dx + dy * dy <= rr * rr;
+    }
 
     private void resetStick(Stick st) {
         st.baseX = st.knobX = st.homeX;
@@ -993,6 +1071,8 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     // ---- opacity / idle fade ------------------------------------------------------------------
 
     private String ctlName(int i) {
+        if (i == SLOT_LSTICK) return editLayer == LAYER_AIM ? "Camera stick" : "Left stick";
+        if (i == SLOT_RSTICK) return "Right stick";
         Ctl c = ctls[i];
         if (c == dpad) return "D-pad";
         if (i == 4) return "White";
@@ -1049,14 +1129,24 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             return;
         }
         Stick st = x < getWidth() / 2f ? (aimMode ? rstick : lstick) : (aimMode ? null : rstick);
+        // fixed sticks: only a touch on them; the other one keeps its half
+        Stick fl = aimMode ? rstick : lstick, fr = aimMode ? null : rstick;
+        if (fixedL && near(fl, x, y)) st = fl;
+        else if (fixedR && fr != null && near(fr, x, y)) st = fr;
+        else if (st != null && isFixed(st)) st = null;
         if (st == null || st.pointer != -1) return;
         st.pointer = pid;
         owners.put(pid, st);
         long now = System.currentTimeMillis();
         if (now - st.lastDown < 300) { st.clicked = true; button(st.click, true); }
         st.lastDown = now;
-        // Floating stick: centre under the finger.
-        st.baseX = x; st.baseY = y; st.knobX = x; st.knobY = y;
+        if (isFixed(st)) {   // fixed: the base stays put, the knob goes to the finger
+            st.baseX = st.homeX; st.baseY = st.homeY; st.knobX = x; st.knobY = y;
+            move(pid, x, y);
+        } else {
+            // Floating stick: centre under the finger.
+            st.baseX = x; st.baseY = y; st.knobX = x; st.knobY = y;
+        }
         haptic();
     }
 
@@ -1069,7 +1159,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
             float dx = x - st.baseX, dy = y - st.baseY;
             float len = (float) Math.hypot(dx, dy);
             if (len > st.radius) {
-                if (st == lstick) {
+                if (st == lstick || isFixed(st)) {
                     // Movement stick: the base stays where the finger first
                     // touched; past the rim it is simply full deflection, the
                     // knob resting on the rim.
@@ -1509,8 +1599,23 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         }
     }
 
+    private boolean isFixed(Stick st) {
+        boolean leftSlot = st == lstick || (st == rstick && aimMode);
+        return leftSlot ? fixedL : fixedR;
+    }
+
+    private void drawStickIdle(Canvas cv, Stick st) {
+        fill.setColor(0x25000000);
+        cv.drawCircle(st.homeX, st.homeY, st.radius, fill);
+        stroke.setColor(0x77FFFFFF);
+        cv.drawCircle(st.homeX, st.homeY, st.radius, stroke);
+        fill.setColor(0x66FFFFFF);
+        cv.drawCircle(st.homeX, st.homeY, st.radius * 0.45f, fill);
+    }
+
     private void drawStick(Canvas cv, Stick st) {
         boolean active = st.pointer != -1;
+        if (!active && isFixed(st)) { drawStickIdle(cv, st); return; }
         if (!active) return;   // the sticks appear only under a finger
         fill.setColor(active ? 0x40FFFFFF : 0x25000000);
         cv.drawCircle(st.baseX, st.baseY, st.radius, fill);

@@ -41,6 +41,10 @@ final class Settings {
     String padLayout() { return p.getString("pad_layout_v2", ""); }
     String padLayoutV1() { return p.getString("pad_layout_v1", ""); }
     void setPadLayout(String v) { p.edit().putString("pad_layout_v2", v).apply(); }
+    boolean fixedLeftStick() { return p.getBoolean("fixed_lstick", false); }
+    void setFixedLeftStick(boolean v) { p.edit().putBoolean("fixed_lstick", v).apply(); }
+    boolean fixedRightStick() { return p.getBoolean("fixed_rstick", false); }
+    void setFixedRightStick(boolean v) { p.edit().putBoolean("fixed_rstick", v).apply(); }
     int padMode() { return p.getInt("pad_mode", PAD_AUTO); }
     void setPadMode(int m) { p.edit().putInt("pad_mode", m).apply(); }
     int scale() { return p.getInt("scale", 2); }   // x2 by default: sharper
