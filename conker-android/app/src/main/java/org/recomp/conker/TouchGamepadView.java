@@ -146,6 +146,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         float cx, cy, r;           // circle (buttons, d-pad, stick base)
         RectF rect;                // rounded rect (shoulders, triggers, back/start)
         boolean pressed;
+        float sc = 1f;             // the player's size for it (layout editor)
         Ctl(int kind, int id, String label, int color) { this.kind = kind; this.id = id; this.label = label; this.color = color; }
         boolean hit(float x, float y, float slop) {
             if (rect != null) {
@@ -265,6 +266,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         Ctl cut = new Ctl(K_BUTTON, 101, "CUT", 0xFFFF9800);
         Ctl game = new Ctl(K_BUTTON, 102, "GAME", 0xFF00E5FF);
         ctls = new Ctl[] { a, b, x, y, lb, rb, lt, rt, back, start, dpad, toggle };
+        loadLayout();
 
         setFocusable(false);
         handler.post(attachPoll);
@@ -305,6 +307,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
                     if (rstick.pointer != -1) releaseStick(rstick);
                     aimMode = aim;
                     applyAimLayout();
+                    applyLayout();
                     resetStick(rstick);
                     invalidate();
                 }
@@ -545,6 +548,207 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         resetStick(rstick);
 
         text.setTextSize(15 * s);
+        baseText = 15 * s;
+        for (int k = 0; k < EDIT_IDX.length; k++) {   // the defaults, for the player's layout
+            Ctl c = ctls[EDIT_IDX[k]];
+            if (c.rect != null) {
+                defCx[k] = c.rect.centerX(); defCy[k] = c.rect.centerY();
+                defW[k] = c.rect.width(); defH[k] = c.rect.height(); defR[k] = 0;
+            } else {
+                defCx[k] = c.cx; defCy[k] = c.cy; defR[k] = c.r; defW[k] = defH[k] = 0;
+            }
+        }
+        haveDefaults = true;
+        applyLayout();
+    }
+
+    // ---- the player's layout: per mode, where each button sits and how big -----------------
+
+    /** Buttons the player can move and resize: A B X Y, L R, START (the
+     *  sticks float under the thumb, the rest is hidden in single player). */
+    private static final int[] EDIT_IDX = { 0, 1, 2, 3, 6, 7, 9 };
+    static final int LAYER_BASIC = 0, LAYER_AIM = 1;
+    private final float[] defCx = new float[EDIT_IDX.length], defCy = new float[EDIT_IDX.length],
+            defR = new float[EDIT_IDX.length], defW = new float[EDIT_IDX.length], defH = new float[EDIT_IDX.length];
+    private boolean haveDefaults;
+    private float baseText;
+    /** [layer][k*3 + 0..2]: centre x, y (fractions of the view), scale; NaN = default */
+    private final float[][] lay = new float[2][EDIT_IDX.length * 3];
+
+    private void loadLayout() {
+        for (float[] l : lay) java.util.Arrays.fill(l, Float.NaN);
+        String v = new Settings(getContext()).padLayout();
+        if (v == null || v.isEmpty()) return;
+        for (String e : v.split(";")) {
+            String[] f = e.split(",");
+            if (f.length != 5) continue;
+            try {
+                int layer = Integer.parseInt(f[0]), k = Integer.parseInt(f[1]);
+                if (layer < 0 || layer > 1 || k < 0 || k >= EDIT_IDX.length) continue;
+                lay[layer][k * 3] = Float.parseFloat(f[2]);
+                lay[layer][k * 3 + 1] = Float.parseFloat(f[3]);
+                lay[layer][k * 3 + 2] = Float.parseFloat(f[4]);
+            } catch (NumberFormatException ex) { /* skip it */ }
+        }
+    }
+
+    private void saveLayout() {
+        StringBuilder b = new StringBuilder();
+        for (int layer = 0; layer < 2; layer++)
+            for (int k = 0; k < EDIT_IDX.length; k++) {
+                float[] l = lay[layer];
+                if (Float.isNaN(l[k * 3]) && Float.isNaN(l[k * 3 + 2])) continue;
+                if (b.length() > 0) b.append(';');
+                b.append(layer).append(',').append(k).append(',')
+                 .append(l[k * 3]).append(',').append(l[k * 3 + 1]).append(',').append(l[k * 3 + 2]);
+            }
+        new Settings(getContext()).setPadLayout(b.toString());
+    }
+
+    private int layoutLayer() { return editMode ? editLayer : (aimMode ? LAYER_AIM : LAYER_BASIC); }
+
+    /** Place the editable buttons for the current mode: defaults, then the player's changes. */
+    private void applyLayout() {
+        if (!haveDefaults) return;
+        float w = getWidth(), h = getHeight();
+        float[] l = lay[layoutLayer()];
+        for (int k = 0; k < EDIT_IDX.length; k++) {
+            Ctl c = ctls[EDIT_IDX[k]];
+            float x = Float.isNaN(l[k * 3]) ? defCx[k] : l[k * 3] * w;
+            float y = Float.isNaN(l[k * 3 + 1]) ? defCy[k] : l[k * 3 + 1] * h;
+            float sc = Float.isNaN(l[k * 3 + 2]) ? 1f : l[k * 3 + 2];
+            c.sc = sc;
+            if (defR[k] == 0) {
+                float hw = defW[k] * sc / 2f, hh = defH[k] * sc / 2f;
+                c.rect = new RectF(x - hw, y - hh, x + hw, y + hh);
+            } else {
+                c.rect = null; c.cx = x; c.cy = y; c.r = defR[k] * sc;
+            }
+        }
+    }
+
+    // ---- layout editor (Settings -> Configure controls layout) ------------------------------
+
+    interface LayoutEditListener { void onSelection(String name, int scalePct); }
+    private boolean editMode;
+    private int editLayer = LAYER_BASIC, editSel = -1, editPid = -1;
+    private float editOffX, editOffY;
+    private LayoutEditListener editListener;
+
+    boolean isEditingLayout() { return editMode; }
+
+    void beginLayoutEdit(int layer, LayoutEditListener l) {
+        releaseAll();
+        editMode = true; editLayer = layer; editSel = -1; editPid = -1; editListener = l;
+        applyLayout();
+        notifyEdit();
+        invalidate();
+    }
+
+    void setEditLayer(int layer) {
+        editLayer = layer; editSel = -1; editPid = -1;
+        applyLayout(); notifyEdit(); invalidate();
+    }
+
+    void setEditScale(int pct) {
+        if (!editMode || editSel < 0) return;
+        lay[editLayer][editSel * 3 + 2] = Math.max(50, Math.min(300, pct)) / 100f;
+        applyLayout(); invalidate();
+    }
+
+    /** the mode being edited back to the defaults */
+    void resetEditLayer() {
+        java.util.Arrays.fill(lay[editLayer], Float.NaN);
+        saveLayout(); applyLayout(); notifyEdit(); invalidate();
+    }
+
+    void endLayoutEdit() {
+        if (!editMode) return;
+        editMode = false; editSel = -1; editPid = -1; editListener = null;
+        saveLayout(); applyLayout(); invalidate();
+    }
+
+    private void notifyEdit() {
+        if (editListener == null) return;
+        if (editSel < 0) { editListener.onSelection(null, 100); return; }
+        float sc = lay[editLayer][editSel * 3 + 2];
+        editListener.onSelection(ctls[EDIT_IDX[editSel]].label, Math.round((Float.isNaN(sc) ? 1f : sc) * 100));
+    }
+
+    private boolean editTouch(MotionEvent e) {
+        int action = e.getActionMasked(), idx = e.getActionIndex();
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN: {
+                if (editPid != -1) break;
+                float x = e.getX(idx), y = e.getY(idx);
+                int hit = -1;
+                for (int k = EDIT_IDX.length - 1; k >= 0 && hit < 0; k--)
+                    if (ctls[EDIT_IDX[k]].hit(x, y, 10 * dp)) hit = k;
+                editSel = hit;
+                if (hit >= 0) {
+                    Ctl c = ctls[EDIT_IDX[hit]];
+                    float cx = c.rect != null ? c.rect.centerX() : c.cx, cy = c.rect != null ? c.rect.centerY() : c.cy;
+                    editOffX = x - cx; editOffY = y - cy;
+                    editPid = e.getPointerId(idx);
+                    haptic();
+                }
+                notifyEdit();
+                break;
+            }
+            case MotionEvent.ACTION_MOVE: {
+                if (editPid == -1 || editSel < 0) break;
+                int i = e.findPointerIndex(editPid);
+                if (i < 0) break;
+                float w = getWidth(), h = getHeight();
+                float x = Math.max(0, Math.min(w, e.getX(i) - editOffX));
+                float y = Math.max(0, Math.min(h, e.getY(i) - editOffY));
+                float[] l = lay[editLayer];
+                l[editSel * 3] = x / w; l[editSel * 3 + 1] = y / h;
+                if (Float.isNaN(l[editSel * 3 + 2])) l[editSel * 3 + 2] = 1f;
+                applyLayout();
+                break;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
+            case MotionEvent.ACTION_CANCEL:
+                if (action == MotionEvent.ACTION_CANCEL || e.getPointerId(idx) == editPid) {
+                    if (editPid != -1) saveLayout();
+                    editPid = -1;
+                }
+                break;
+        }
+        invalidate();
+        return true;
+    }
+
+    private void drawEditor(Canvas cv) {
+        cv.drawColor(0x66000000);
+        boolean ru = uiRu();
+        text.setTextSize(baseText);
+        text.setColor(0xCCF4E6C8);
+        String zone = editLayer == LAYER_AIM
+                ? (ru ? "Прицеливание: камера под левым большим пальцем" : "Aiming: the camera stick moves under the left thumb")
+                : (ru ? "Левая половина экрана: стик движения" : "Left half of the screen: the movement stick");
+        cv.drawText(zone, getWidth() * 0.27f, getHeight() * 0.62f, text);
+        cv.drawText(ru ? "Коснитесь кнопки, чтобы выбрать её; перетащите, чтобы передвинуть"
+                       : "Tap a button to select it, drag it to move it",
+                getWidth() / 2f, getHeight() - 14 * dp, text);
+        for (int k = 0; k < EDIT_IDX.length; k++) {
+            Ctl c = ctls[EDIT_IDX[k]];
+            if (c.rect != null) drawRect(cv, c); else drawCircle(cv, c, c.color, true);
+            if (k == editSel) {
+                Paint hl = new Paint(Paint.ANTI_ALIAS_FLAG);
+                hl.setStyle(Paint.Style.STROKE);
+                hl.setStrokeWidth(3.5f * dp);
+                hl.setColor(0xFFF2C46B);
+                float pad = 5 * dp;
+                if (c.rect != null) {
+                    RectF r = new RectF(c.rect.left - pad, c.rect.top - pad, c.rect.right + pad, c.rect.bottom + pad);
+                    cv.drawRoundRect(r, 12 * dp, 12 * dp, hl);
+                } else cv.drawCircle(c.cx, c.cy, c.r + pad, hl);
+            }
+        }
     }
 
     private static void place(Ctl c, float x, float y, float r) { c.cx = x; c.cy = y; c.r = r; c.rect = null; }
@@ -557,6 +761,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     // ---- input ------------------------------------------------------------------------------
 
     @Override public boolean onTouchEvent(MotionEvent e) {
+        if (editMode) return editTouch(e);
         int action = e.getActionMasked();
         int idx = e.getActionIndex();
         switch (action) {
@@ -1215,6 +1420,7 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
     }
 
     @Override protected void onDraw(Canvas canvas) {
+        if (editMode) { drawEditor(canvas); return; }
         if (loadingNow) drawLoading(canvas);
         if (recVisible) drawStateTag(canvas);
         if (recVisible) drawRec(canvas);
@@ -1242,7 +1448,9 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         stroke.setColor(withAlpha(color, c.pressed ? 0xFF : 0x99));
         cv.drawCircle(c.cx, c.cy, c.r, stroke);
         text.setColor(c.pressed ? Color.WHITE : withAlpha(labelColored ? color : Color.WHITE, 0xCC));
+        if (baseText > 0) text.setTextSize(baseText * c.sc);
         cv.drawText(c.label, c.cx, c.cy - (text.descent() + text.ascent()) / 2f, text);
+        if (baseText > 0) text.setTextSize(baseText);
     }
 
     private void drawRect(Canvas cv, Ctl c) {
@@ -1252,7 +1460,9 @@ public class TouchGamepadView extends View implements InputManager.InputDeviceLi
         stroke.setColor(c.pressed ? 0xFFFFFFFF : 0x99FFFFFF);
         cv.drawRoundRect(c.rect, rad, rad, stroke);
         text.setColor(c.pressed ? Color.BLACK : 0xCCFFFFFF);
+        if (baseText > 0) text.setTextSize(baseText * c.sc);
         cv.drawText(c.label, c.rect.centerX(), c.rect.centerY() - (text.descent() + text.ascent()) / 2f, text);
+        if (baseText > 0) text.setTextSize(baseText);
     }
 
     private void drawDpad(Canvas cv) {

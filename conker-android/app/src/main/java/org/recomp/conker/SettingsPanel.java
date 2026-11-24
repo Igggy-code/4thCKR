@@ -119,6 +119,15 @@ final class SettingsPanel extends FrameLayout {
         g.check(st.padMode());
         g.setOnCheckedChangeListener((gr, id) -> { st.setPadMode(id); pad.setPadMode(id); });
         body.addView(g);
+        {   // where the buttons sit and how big, per mode
+            boolean ru = "ru".equals(st.language());
+            Button lay = button(ru ? "Настроить раскладку управления" : "Configure controls layout", v -> {
+                close();
+                ViewGroup root = (ViewGroup) getParent();
+                if (root != null) ControlsLayoutBar.open(act, root, pad, ru);
+            });
+            body.addView(lay);
+        }
 
         // render resolution
         section("Render resolution");

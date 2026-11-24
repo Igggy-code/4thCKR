@@ -123,6 +123,7 @@ public class ConkerActivity extends SDLActivity implements TouchGamepadView.Menu
 
     @Override
     public void onBackPressed() {
+        if (ControlsLayoutBar.closeIfOpen()) return;
         if (panel != null) panel.toggle();
     }
 
@@ -143,7 +144,8 @@ public class ConkerActivity extends SDLActivity implements TouchGamepadView.Menu
         // Back (the system button / gesture, not a gamepad's B) opens the menu.
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && panel != null
                 && (event.getSource() & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD) {
-            if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) panel.toggle();
+            if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()
+                    && !ControlsLayoutBar.closeIfOpen()) panel.toggle();
             return true;
         }
         return super.dispatchKeyEvent(event);
