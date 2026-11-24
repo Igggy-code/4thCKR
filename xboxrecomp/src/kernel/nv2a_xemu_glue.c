@@ -183,12 +183,99 @@ static void unguard_range(uint64_t addr, uint64_t size)
     prot_unlock();
 }
 void nv2a_host_unguard(uint64_t addr, uint64_t size) { unguard_range(addr, size); }
+#define PROBE_MAX 64
+static struct { uint32_t addr, size; volatile uint8_t title, own, live; uintptr_t pc, lr; } s_probe[PROBE_MAX];
+/* where the last access to a probed target came from (host pc and lr) */
+uintptr_t nv2a_probe_last_pc, nv2a_probe_last_lr;
+static unsigned s_probe_n;
 void nv2a_host_unguard_all(void)
 {
     if (!s_guard) return;
     prot_lock();
+    for (unsigned i = 0; i < s_probe_n; i++) s_probe[i].live = 0;
     for (uint32_t p = 0; p < RAM_SIZE / PAGE; p++)
         if (s_guard[p]) { s_guard[p] = 0; restore_page_prot(p); }
+    prot_unlock();
+}
+
+/* nv2a-port: read-back probe (NV2A_RB_PROBE). A render target read back to
+ * RAM every frame costs a GPU copy, and the title writing next to it costs
+ * write faults; it is worth it only if something reads those pixels from
+ * RAM. After a read-back lands its pages are guarded (s_guard 2); the first
+ * access opens them and says who it was: a title (or other host) thread,
+ * or the renderer's own thread (a texture read from RAM). The renderer
+ * asks before the next read-back lands (nv2a_host_probe_take). */
+int nv2a_rb_probe_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("NV2A_RB_PROBE") != NULL;
+    return on;
+}
+void nv2a_host_probe(uint64_t addr, uint64_t size)
+{
+    if (!s_guard || !size || addr >= RAM_SIZE) return;
+    uint64_t end = addr + size > RAM_SIZE ? RAM_SIZE : addr + size;
+    prot_lock();
+    int k = -1;
+    for (unsigned i = 0; i < s_probe_n; i++) if (s_probe[i].addr == addr) { k = (int)i; break; }
+    if (k < 0) {
+        for (unsigned i = 0; i < s_probe_n; i++) if (!s_probe[i].live) { k = (int)i; break; }
+        if (k < 0 && s_probe_n < PROBE_MAX) k = (int)s_probe_n++;
+    }
+    if (k >= 0) {
+        s_probe[k].addr = (uint32_t)addr; s_probe[k].size = (uint32_t)(end - addr);
+        s_probe[k].title = s_probe[k].own = 0; s_probe[k].live = 1;
+        for (uint32_t p = (uint32_t)(addr / PAGE); (uint64_t)p * PAGE < end; p++)
+            if (!s_guard[p]) { s_guard[p] = 2; set_views(p, PROT_NONE); }
+    }
+    prot_unlock();
+}
+/* who touched it since nv2a_host_probe: bit 0 title/host, bit 1 renderer;
+ * -1 when it was not probed */
+int nv2a_host_probe_take(uint64_t addr)
+{
+    int r = -1;
+    prot_lock();
+    for (unsigned i = 0; i < s_probe_n; i++) {
+        if (!s_probe[i].live || s_probe[i].addr != addr) continue;
+        r = (s_probe[i].title ? 1 : 0) | (s_probe[i].own ? 2 : 0);
+        s_probe[i].live = 0;
+        break;
+    }
+    prot_unlock();
+    return r;
+}
+/* the same without ending the probe */
+int nv2a_host_probe_peek(uint64_t addr)
+{
+    int r = -1;
+    prot_lock();
+    for (unsigned i = 0; i < s_probe_n; i++) {
+        if (!s_probe[i].live || s_probe[i].addr != addr) continue;
+        r = (s_probe[i].title ? 1 : 0) | (s_probe[i].own ? 2 : 0);
+        break;
+    }
+    prot_unlock();
+    return r;
+}
+/* fault on a probed page: note who, open the probed ranges on that page */
+static void probe_touch(uint32_t page, int own, void *ucv)
+{
+#if defined(__aarch64__)
+    nv2a_probe_last_pc = (uintptr_t)((ucontext_t *)ucv)->uc_mcontext.pc;
+    nv2a_probe_last_lr = (uintptr_t)((ucontext_t *)ucv)->uc_mcontext.regs[30];
+#else
+    (void)ucv;
+#endif
+    prot_lock();
+    uint64_t a = (uint64_t)page * PAGE, b = a + PAGE;
+    for (unsigned i = 0; i < s_probe_n; i++) {
+        if (!s_probe[i].live) continue;
+        uint64_t pa = s_probe[i].addr, pb = pa + s_probe[i].size;
+        if (pb <= a || pa >= b) continue;
+        if (own) s_probe[i].own = 1; else s_probe[i].title = 1;
+    }
+    if (s_guard[page] == 2) { s_guard[page] = 0; restore_page_prot(page); }
     prot_unlock();
 }
 
@@ -228,6 +315,7 @@ void xbox_GuestRamPrepareWrite(uint32_t va, uint32_t len)
         return;                                      /* not GPU-visible memory */
     uint64_t end = (uint64_t)phys + len;
     if (end > RAM_SIZE) end = RAM_SIZE;
+    unguard_range(phys, end - phys);   /* a guarded page would fail the read() */
     /* one lock, and one mprotect per run of protected pages and view (was
      * a lock and an mprotect per page and view: a 256 KB audio-stream read
      * took 52 ms here, a visible hitch) */
@@ -647,6 +735,10 @@ int xbox_Nv2aXemuFault(void *ucv, uintptr_t fault)
     for (size_t v = 0; v < sizeof s_views / sizeof s_views[0]; v++) {
         if (va >= s_views[v] && va < s_views[v] + RAM_SIZE) {
             uint32_t page = (va - s_views[v]) / PAGE;
+            if (s_guard && __atomic_load_n(&s_guard[page], __ATOMIC_ACQUIRE) == 2) {
+                probe_touch(page, (int)syscall(SYS_gettid) == s_pfifo_tid, ucv);
+                return 1;   /* retry the access */
+            }
             if (s_guard && __atomic_load_n(&s_guard[page], __ATOMIC_ACQUIRE)) {
                 /* a guarded render target: wait for its read-back (not on
                  * the renderer's own thread, which would wait for itself) */

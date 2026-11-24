@@ -958,6 +958,146 @@ void pgraph_vk_record_eager_readback(PGRAPHState *pg, int slot)
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &post, 0, NULL);
 }
 
+/* nv2a-port: per-frame read-backs nothing reads. Small render targets are
+ * read back to RAM at every flip in case the title reads them (an exposure
+ * reduction, say); Conker's effects draw a dozen 128x128-256x256 targets a
+ * frame that nothing ever reads from RAM -- their GPU copies, and the write
+ * faults the title takes next to them, were a third of the GPU's work in
+ * the lava levels, more on a throttled phone. So each target is watched
+ * while it is read back: after landing, its pages are guarded and the first
+ * access says who looked (nv2a_xemu_glue.c, nv2a_host_probe). A target of
+ * 128x128 or more read back RB_LEARN times and never looked at stops being
+ * read back; its pages stay guarded, and the first access ever (one stale
+ * read) puts it back for good. Learnt again at each level.
+ * NV2A_NO_RB_LAZY=1: off (every small target read back, as before);
+ * NV2A_RB_PROBE=1: the counts every 10 s. */
+extern int nv2a_rb_probe_on(void);
+extern void nv2a_host_probe(uint64_t addr, uint64_t size);
+extern int nv2a_host_probe_take(uint64_t addr);
+extern void nv2a_host_unguard_all(void);
+#define RB_LEARN 90
+typedef struct { uint32_t addr; uint16_t w, h; uint8_t sz, lazy, read;
+                 unsigned land, probed, title, own, cum; } RbEnt;
+static RbEnt s_rbp[96];
+static unsigned s_rbp_n;
+static bool rb_lazy_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("NV2A_NO_RB_LAZY") == NULL;
+    return on;
+}
+static RbEnt *rb_ent(SurfaceBinding *s, bool add)
+{
+    {   /* a new level: learn again */
+        extern char g_xbox_level_name[48];
+        static char lvl[48];
+        if (strncmp(lvl, g_xbox_level_name, sizeof lvl)) {
+            memcpy(lvl, g_xbox_level_name, sizeof lvl);
+            if (s_rbp_n) {
+                s_rbp_n = 0;
+                nv2a_host_unguard_all();
+            }
+        }
+    }
+    for (unsigned i = 0; i < s_rbp_n; i++)
+        if (s_rbp[i].addr == s->vram_addr && s_rbp[i].w == s->width && s_rbp[i].h == s->height)
+            return &s_rbp[i];
+    if (!add || s_rbp_n >= ARRAY_SIZE(s_rbp)) return NULL;
+    RbEnt *e = &s_rbp[s_rbp_n++];
+    memset(e, 0, sizeof *e);
+    e->addr = (uint32_t)s->vram_addr; e->w = (uint16_t)s->width;
+    e->h = (uint16_t)s->height; e->sz = s->swizzle;
+    return e;
+}
+/* still learning this target: guard it after its read-back lands */
+static bool rb_should_probe(SurfaceBinding *s)
+{
+    if (!rb_lazy_on()) return false;
+    RbEnt *e = rb_ent(s, true);
+    return e && !e->read && !e->lazy;
+}
+static void rb_note(SurfaceBinding *s, int who)
+{
+    RbEnt *e = rb_ent(s, true);
+    if (e) {
+        e->land++;
+        if (who >= 0) {
+            e->probed++; e->cum++;
+            if (who & 1) e->title++;
+            if (who & 2) e->own++;
+            if (who > 0) {
+                if (e->lazy) {
+                    extern uintptr_t nv2a_probe_last_pc, nv2a_probe_last_lr;
+                    Dl_info a = {0}, b = {0};
+                    dladdr((void *)nv2a_probe_last_pc, &a); dladdr((void *)nv2a_probe_last_lr, &b);
+                    fprintf(stderr, "[RBLAZY] %08x %ux%u: read from RAM after all (at %s+0x%lx from %s+0x%lx): read back again\n",
+                            e->addr, e->w, e->h,
+                            a.dli_sname ? a.dli_sname : "?", (unsigned long)(nv2a_probe_last_pc - (uintptr_t)a.dli_saddr),
+                            b.dli_sname ? b.dli_sname : "?", (unsigned long)(nv2a_probe_last_lr - (uintptr_t)b.dli_saddr));
+                }
+                e->read = 1; e->lazy = 0;   /* read: always read back */
+            } else if (!e->read && e->cum >= RB_LEARN &&
+                       (long)e->w * e->h >= 128L * 128L) {
+                e->lazy = 1;
+                fprintf(stderr, "[RBLAZY] %08x %ux%u%s: never read from RAM in %u frames, "
+                                "no longer read back\n", e->addr, e->w, e->h, e->sz ? " sz" : "", e->cum);
+            }
+        }
+    }
+    if (!nv2a_rb_probe_on()) return;
+    static int64_t last;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+    if (!last) last = now;
+    if (now - last < 10000) return;
+    last = now;
+    for (unsigned i = 0; i < s_rbp_n; i++) {
+        fprintf(stderr, "[RBPROBE] %08x %ux%u%s: %u landed, %u probed, read by title %u, by renderer %u%s\n",
+                s_rbp[i].addr, s_rbp[i].w, s_rbp[i].h, s_rbp[i].sz ? " sz" : "",
+                s_rbp[i].land, s_rbp[i].probed, s_rbp[i].title, s_rbp[i].own,
+                s_rbp[i].lazy ? " (lazy)" : s_rbp[i].read ? " (read)" : "");
+        s_rbp[i].land = s_rbp[i].probed = s_rbp[i].title = s_rbp[i].own = 0;
+    }
+}
+extern int nv2a_host_probe_peek(uint64_t addr);
+static bool rb_is_lazy_untouched(SurfaceBinding *sb)
+{
+    if (!rb_lazy_on()) return false;
+    RbEnt *e = rb_ent(sb, false);
+    if (!e || !e->lazy) return false;
+    int pk = nv2a_host_probe_peek(sb->vram_addr);
+    if (pk != 0) {
+        static int nlog;
+        if (nlog++ < 30)
+            fprintf(stderr, "[RBLAZY] %08x %ux%u: upload asked, probe state %d (dlp %d)\n",
+                    e->addr, e->w, e->h, pk, sb->download_pending);
+    }
+    return pk == 0;
+}
+/* drawn again: read it back at the flip? (false: a lazy target nothing has
+ * looked at; its RAM stays guarded) */
+static bool rb_want_readback(SurfaceBinding *sb)
+{
+    if (!rb_lazy_on()) return true;
+    RbEnt *e = rb_ent(sb, false);
+    if (!e || !e->lazy) return true;
+    int who = nv2a_host_probe_take(sb->vram_addr);
+    if (who > 0) {
+        e->lazy = 0; e->read = 1;
+        extern uintptr_t nv2a_probe_last_pc, nv2a_probe_last_lr;
+        Dl_info a = {0}, b = {0};
+        dladdr((void *)nv2a_probe_last_pc, &a); dladdr((void *)nv2a_probe_last_lr, &b);
+        fprintf(stderr, "[RBLAZY] %08x %ux%u: read from RAM after all (%s at %s+0x%lx from %s+0x%lx): read back again\n",
+                e->addr, e->w, e->h, (who & 1) ? "title" : "renderer",
+                a.dli_sname ? a.dli_sname : "?", (unsigned long)(nv2a_probe_last_pc - (uintptr_t)a.dli_saddr),
+                b.dli_sname ? b.dli_sname : "?", (unsigned long)(nv2a_probe_last_lr - (uintptr_t)b.dli_saddr));
+        return true;
+    }
+    nv2a_host_probe(sb->vram_addr, (uint64_t)sb->pitch * sb->height);
+    nv2a_site_hit("rb:lazy", 0, sb->width, sb->height);
+    return false;
+}
+
 void pgraph_vk_complete_eager_readback(NV2AState *d, int slot)
 {
     PGRAPHVkState *r = d->pgraph.vk_renderer_state;
@@ -974,6 +1114,7 @@ void pgraph_vk_complete_eager_readback(NV2AState *d, int slot)
         QTAILQ_FOREACH(it, &r->surfaces, entry) if (it == s) { live = true; break; }
         if (!live || s->vram_addr != s_rb[slot][k].addr) continue;
         uint8_t *pixels = d->vram_ptr + s->vram_addr;
+        if (rb_lazy_on()) rb_note(s, nv2a_host_probe_take(s->vram_addr));
         prepare_guest_write(d, pixels, (size_t)s->pitch * s->height);
         uint8_t *src = (uint8_t *)mapped + s_rb[slot][k].off;
         if (s->swizzle) {
@@ -986,6 +1127,7 @@ void pgraph_vk_complete_eager_readback(NV2AState *d, int slot)
         }
         nv2a_profile_inc_counter(NV2A_PROF_SURF_DOWNLOAD); nv2a_surf_dl_total++;
         surf_note_ram(d, s);
+        if (rb_should_probe(s)) nv2a_host_probe(s->vram_addr, (uint64_t)s->pitch * s->height);
         /* our own write of the surface's pixels must not mark the surface
          * dirty for itself (that re-uploaded it next frame, sometimes with
          * pixels older than the GPU's). NV2A_RB_SELFDIRTY=1: old way. */
@@ -1654,6 +1796,19 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     if (!(surface->upload_pending || force)) {
+        return;
+    }
+    {   RbEnt *le = rb_lazy_on() ? rb_ent(surface, false) : NULL;
+        static int nlog;
+        if (le && le->lazy && (force || !surface->download_pending) && nlog++ < 30)
+            fprintf(stderr, "[RBLAZY] %08x %ux%u: upload with force %d dlp %d\n",
+                    le->addr, le->w, le->h, force, surface->download_pending);
+    }
+    if (!force && rb_is_lazy_untouched(surface)) {
+        /* not read back any more and no guest write reached it (see
+         * rb_want_readback): RAM is stale and the GPU's image is current */
+        surface->upload_pending = false;
+        nv2a_site_hit("upload:lazy-skip", 0, surface->width, surface->height);
         return;
     }
 
@@ -2391,6 +2546,15 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                         nv2a_site_hit("upload:ram-changed", 0, surface->width, surface->height);
                     }
                 }
+                if (mem_dirty && rb_is_lazy_untouched(surface)) {
+                    /* a target no longer read back: its RAM is stale, and
+                     * its pages are guarded, so no guest write reached it
+                     * (that would have ended the probe); the dirty mark
+                     * came from a neighbour's page. Uploading the stale RAM
+                     * would put old pixels over the GPU's. */
+                    nv2a_site_hit("upload:lazy-skip", 0, surface->width, surface->height);
+                    mem_dirty = false;
+                }
                 surface->upload_pending |= mem_dirty;
                 if (mem_dirty) {
                     nv2a_site_hit("memdirty", 0, surface->width, surface->height);
@@ -2492,7 +2656,12 @@ bind_found:
             }
             static int at_flip = -1;
             if (at_flip < 0) at_flip = !getenv("NV2A_EAGER_NOW");
-            if ((long)sb->width * (long)sb->height <= eager_max && at_flip) {
+            if ((long)sb->width * (long)sb->height <= eager_max && at_flip &&
+                !rb_want_readback(sb)) {
+                /* nothing reads it from RAM: left on the GPU (download_pending
+                 * still says RAM is behind, for anything that asks) */
+                sb->download_pending = true;
+            } else if ((long)sb->width * (long)sb->height <= eager_max && at_flip) {
                 /* Batched: read back once per frame, at the flip, instead of
                  * draining the GPU at every render-target switch. */
                 sb->eager_pending = true;
