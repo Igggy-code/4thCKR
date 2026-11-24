@@ -983,7 +983,8 @@ static unsigned s_rbp_n;
 static bool rb_lazy_on(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("NV2A_NO_RB_LAZY") == NULL;
+    /* opt-in until the flicker seen with it (0.7.26-0.7.28) is explained */
+    if (on < 0) on = getenv("NV2A_RB_LAZY") != NULL && getenv("NV2A_NO_RB_LAZY") == NULL;
     return on;
 }
 static RbEnt *rb_ent(SurfaceBinding *s, bool add)

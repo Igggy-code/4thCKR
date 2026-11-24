@@ -662,8 +662,10 @@ void *pfifo_thread(void *arg)
                      * no longer blocks on it), so the title reads the real
                      * count at its next frame, not the provisional one */
                     extern bool pgraph_vk_slot_reports_pending(void);
+                    static int fast = -1;   /* NV2A_REPORT_NOWAIT only: see reports.c */
+                    if (fast < 0) fast = getenv("NV2A_REPORT_NOWAIT") != NULL;
                     bool got = qemu_cond_timedwait(&d->pfifo.fifo_cond, &d->pfifo.lock,
-                                                   pgraph_vk_slot_reports_pending() ? 1 : 50);
+                                                   fast && pgraph_vk_slot_reports_pending() ? 1 : 50);
                     clock_gettime(CLOCK_MONOTONIC, &b);
                     double w = (b.tv_sec - ie.tv_sec) * 1e3 + (b.tv_nsec - ie.tv_nsec) / 1e6;
                     extern volatile int g_conker_in_level;
