@@ -73,7 +73,7 @@ final class ControlsLayoutBar extends FrameLayout {
         row.addView(mode, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, px(36)));
 
         selName = label("", 13, CREAM);
-        LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(px(118), ViewGroup.LayoutParams.WRAP_CONTENT);
+        LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(px(104), ViewGroup.LayoutParams.WRAP_CONTENT);
         nl.setMargins(px(12), 0, 0, 0);
         row.addView(selName, nl);
 
@@ -82,7 +82,7 @@ final class ControlsLayoutBar extends FrameLayout {
         scale.setProgressTintList(android.content.res.ColorStateList.valueOf(AMBER));
         scale.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(0x55FFFFFF));
         scale.setThumbTintList(android.content.res.ColorStateList.valueOf(AMBER));
-        row.addView(scale, new LinearLayout.LayoutParams(px(170), ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(scale, new LinearLayout.LayoutParams(px(160), ViewGroup.LayoutParams.WRAP_CONTENT));
         pct = label("100%", 13, CREAM);
         row.addView(pct, new LinearLayout.LayoutParams(px(46), ViewGroup.LayoutParams.WRAP_CONTENT));
         scale.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -94,14 +94,22 @@ final class ControlsLayoutBar extends FrameLayout {
             @Override public void onStopTrackingTouch(SeekBar sb) { }
         });
 
-        row.addView(pill("Reset to default", false, v -> pad.resetEditLayer()));
         row.addView(pill("Done", true, v -> finish()));
 
+        // second row: the how-to, and Reset to default always in sight
+        // (on the first row it could run off a narrow screen)
+        LinearLayout row2 = new LinearLayout(a);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams r2 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        r2.setMargins(0, px(6), 0, 0);
+        card.addView(row2, r2);
         hint = label("", 11.5f, CREAM_DIM);
-        hint.setGravity(Gravity.START);
-        LinearLayout.LayoutParams hl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        hl.setMargins(px(4), px(5), 0, 0);
-        card.addView(hint, hl);
+        hint.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams hl = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        hl.setMargins(px(4), 0, 0, 0);
+        row2.addView(hint, hl);
+        row2.addView(pill("Reset to default", false, v -> pad.resetEditLayer()));
 
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
@@ -141,7 +149,7 @@ final class ControlsLayoutBar extends FrameLayout {
 
     private void onSelection(String name, int scalePct) {
         boolean sel = name != null;
-        selName.setText(sel ? "Button " + name : "No button selected");
+        selName.setText(sel ? "Button " + name : "None selected");
         hint.setText(sel ? "Drag it to move it · use the slider to resize it · tap another button to switch"
                          : "Tap a button to select it, then drag it where you want it");
         scale.setEnabled(sel);
