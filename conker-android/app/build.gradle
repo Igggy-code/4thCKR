@@ -13,8 +13,8 @@ android {
         applicationId "org.recomp.conker"
         minSdkVersion 29
         targetSdkVersion 35
-        versionCode 95
-        versionName "0.7.25"
+        versionCode 96
+        versionName "0.7.26"
         ndk { abiFilters 'arm64-v8a' }
         if (nativeFromCMake) {
             externalNativeBuild {

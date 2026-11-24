@@ -281,7 +281,18 @@ void pgraph_vk_process_pending_reports(NV2AState *d)
     } else if (*dma_get == *dma_put &&
                (!QSIMPLEQ_EMPTY(&r->slot_reports[0]) ||
                 !QSIMPLEQ_EMPTY(&r->slot_reports[1]))) {
-        /* the title waits for a report a frame in flight carries */
-        pgraph_vk_wait_deferred();
+        /* the title waits for a report a frame in flight carries.
+         * nv2a-port: not with provisional reports (pgraph_vk_get_report):
+         * the title already has a value and the done mark, and the real
+         * count lands when the frame retires. Waiting here held the pfifo
+         * thread on the GPU's fence for 20-40 ms whenever the title paused
+         * its command stream with a visibility test in flight -- 15 ms a
+         * frame in the lava levels on a throttled phone. Retire what has
+         * finished, without blocking. NV2A_REPORT_WAIT=1: wait, as before. */
+        static int wait = -1;
+        if (wait < 0) wait = getenv("NV2A_REPORT_WAIT") != NULL ||
+                             getenv("NV2A_NO_PROVISIONAL_REPORT") != NULL;
+        if (wait) pgraph_vk_wait_deferred();
+        else pgraph_vk_poll_slots();
     }
 }
