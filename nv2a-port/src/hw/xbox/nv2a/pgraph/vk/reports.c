@@ -296,3 +296,12 @@ void pgraph_vk_process_pending_reports(NV2AState *d)
         else pgraph_vk_poll_slots();
     }
 }
+
+/* a frame in flight carries visibility reports (pfifo.c, idle wait) */
+bool pgraph_vk_slot_reports_pending(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->pgraph.vk_renderer_state) return false;
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    return !QSIMPLEQ_EMPTY(&r->slot_reports[0]) || !QSIMPLEQ_EMPTY(&r->slot_reports[1]);
+}

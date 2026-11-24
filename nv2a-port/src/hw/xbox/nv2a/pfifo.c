@@ -656,7 +656,14 @@ void *pfifo_thread(void *arg)
                     static struct timespec ie; static int ie_on, ie_said, ie_stage;
                     s_nop_on = 0;
                     if (!ie_on) { ie = a; ie_on = 1; ie_stage = 0; }
-                    bool got = qemu_cond_timedwait(&d->pfifo.fifo_cond, &d->pfifo.lock, 50);
+                    /* nv2a-port: a visibility report still on the GPU:
+                     * wake every millisecond to land it as soon as its
+                     * frame is done (pgraph_vk_process_pending_reports
+                     * no longer blocks on it), so the title reads the real
+                     * count at its next frame, not the provisional one */
+                    extern bool pgraph_vk_slot_reports_pending(void);
+                    bool got = qemu_cond_timedwait(&d->pfifo.fifo_cond, &d->pfifo.lock,
+                                                   pgraph_vk_slot_reports_pending() ? 1 : 50);
                     clock_gettime(CLOCK_MONOTONIC, &b);
                     double w = (b.tv_sec - ie.tv_sec) * 1e3 + (b.tv_nsec - ie.tv_nsec) / 1e6;
                     extern volatile int g_conker_in_level;
